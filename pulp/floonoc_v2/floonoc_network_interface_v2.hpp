@@ -20,16 +20,20 @@
 #include <vp/vp.hpp>
 #include <list>
 #include "floonoc_v2.hpp"
+#include "floonoc_link_v2.hpp"
 
-class FlooNocV2;
 class NetworkInterfaceV2;
-class RouterV2;
 
-class NetworkQueueV2 : public FloonocNodeV2
+/**
+ * Per-network injection queue of the NI. Splits external bursts into mesh
+ * requests and feeds them to the NI's link output for its network (req, rsp
+ * or wide).
+ */
+class NetworkQueueV2 : public vp::Block
 {
     friend class NetworkInterfaceV2;
 public:
-    NetworkQueueV2(NetworkInterfaceV2 &ni, std::string name, uint64_t width, bool is_wide);
+    NetworkQueueV2(NetworkInterfaceV2 &ni, std::string name, uint64_t width, int nw);
     void reset(bool active) override;
 
     void check();
@@ -40,13 +44,13 @@ private:
     void enqueue_router_req(vp::IoReq *req, bool is_address, bool wide, bool is_req);
     void enqueue_router_rsp(FloonocReqV2 *req, bool is_address);
     void send_router_req();
-    void unstall_queue(int from_x, int from_y) override;
-    bool handle_request(FloonocNodeV2 *node, FloonocReqV2 *req, int from_x, int from_y) override;
+    void unstall();
 
     NetworkInterfaceV2 &ni;
-    RouterV2 *router;
     uint64_t width;
-    bool is_wide;
+    // Network this queue injects into (NetworkInterfaceV2::NW_*), i.e. which
+    // of the NI's link output ports it drives.
+    int nw;
     vp::Trace trace;
     std::queue<FloonocReqV2 *> queue;
     bool stalled;
@@ -55,11 +59,13 @@ private:
 /**
  * v2 FlooNoC network interface.
  *
- * Same role as the v1 NI: entry/exit point for the mesh. External ports speak
- * the v2 io protocol (burst beats with is_first / is_last / burst_id, plus the
- * retry() deny handshake). Internal mesh traversal uses FloonocReqV2.
+ * Standalone component instantiated by the generator: entry/exit point of the
+ * mesh. External ports speak the v2 io protocol (burst beats with is_first /
+ * is_last / burst_id, plus the retry() deny handshake). Mesh traversal uses
+ * FloonocReqV2 over 'floonoc_link' ports bound to the local (or, for border
+ * NIs, nearest) routers of the three physical networks.
  */
-class NetworkInterfaceV2 : public FloonocNodeV2
+class NetworkInterfaceV2 : public vp::Component
 {
     friend class NetworkQueueV2;
 
@@ -69,7 +75,7 @@ public:
     static constexpr int NW_WIDE  = 2;
     static constexpr int NW_NB    = 3;
 
-    NetworkInterfaceV2(FlooNocV2 *noc, int x, int y, std::string itf_name);
+    NetworkInterfaceV2(vp::ComponentConf &config);
 
     void reset(bool active);
 
@@ -78,13 +84,14 @@ public:
     // request convention): folds a distinct beat's payload onto our request and
     // frees the beat; passes a round-tripped write ack through unchanged.
     FloonocReqV2 *unwrap_response(vp::IoReq *req);
-    void unstall_queue(int from_x, int from_y) override;
 
-    bool handle_request(FloonocNodeV2 *node, FloonocReqV2 *req, int from_x, int from_y) override;
-    int get_x();
-    int get_y();
-    void set_router(int nw, RouterV2 *router);
 private:
+    // Link input callback: a mesh request (or response) delivered by a router.
+    // Returns true when the NI's downstream target denied it (the router must
+    // then stall the corresponding output until unstalled).
+    static bool link_req(vp::Block *__this, FloonocReqV2 *req, int nw);
+    // Link output callback: the router accepts injections again on network nw.
+    static void link_unstall(vp::Block *__this, int nw);
     static vp::IoRespAck wide_response(vp::Block *__this, vp::IoReq *req);
     static void wide_retry(vp::Block *__this, vp::IoRetryChannel);
     static vp::IoRespAck narrow_response(vp::Block *__this, vp::IoReq *req);
@@ -95,16 +102,27 @@ private:
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
     int get_req_nw(bool is_wide, bool is_write);
     int get_rsp_nw(bool is_wide, bool is_write);
+    EntryV2 *get_entry(uint64_t base, uint64_t size);
 
-    FlooNocV2 *noc;
     int ni_outstanding_reqs;
     int x;
     int y;
+    uint64_t narrow_width;
+    uint64_t wide_width;
+
+    // Memory map, address range -> mesh position. Every NI holds the full
+    // table (same 'mappings' property on each).
+    std::vector<EntryV2> entries;
 
     vp::IoMaster wide_output_itf;
     vp::IoMaster narrow_output_itf;
     vp::IoSlave wide_input_itf;
     vp::IoSlave narrow_input_itf;
+
+    // Mesh links, indexed by NW_*: outputs inject into the routers, inputs
+    // receive what the routers deliver.
+    std::array<FloonocLinkMaster, NW_NB> link_out;
+    std::array<FloonocLinkSlave, NW_NB> link_in;
 
     vp::Trace trace;
     NetworkQueueV2 req_queue;
@@ -114,12 +132,6 @@ private:
 
     vp::Signal<uint64_t> signal_narrow_req;
     vp::Signal<uint64_t> signal_wide_req;
-
-    // True when a downstream target returned DENIED to one of our internal
-    // requests; cleared by the corresponding retry callback.
-    bool target_stalled;
-    FloonocNodeV2 *routers_stalled;
-    RouterV2 *router[NW_NB];
 
     // Pending external bursts. Only one of each (per wide x read/write) can be
     // accepted at a time, matching v1 semantics.
@@ -142,9 +154,12 @@ private:
     // per output port.
     FloonocReqV2 *wide_target_stalled_req;
     FloonocReqV2 *narrow_target_stalled_req;
-    // Node to unstall when a target retry frees the corresponding output.
-    FloonocNodeV2 *wide_routers_stalled;
-    FloonocNodeV2 *narrow_routers_stalled;
+    // Link input (NW_* index) to unstall when a target retry frees the
+    // corresponding output, -1 when none. This is the link the denied request
+    // ARRIVED on, which is not implied by its wide flag (a wide read AR
+    // travels on the req network).
+    int wide_stalled_link_nw;
+    int narrow_stalled_link_nw;
 
     // Synchronous responses are pushed here so they fire after the latency
     // annotation expires.

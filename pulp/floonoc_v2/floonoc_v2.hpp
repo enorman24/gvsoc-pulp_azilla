@@ -20,24 +20,19 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 
-class RouterV2;
-class NetworkInterfaceV2;
-class FloonocReqV2;
-
-
-class FloonocNodeV2 : public vp::Block
-{
-public:
-    FloonocNodeV2(Block *parent, std::string name) : vp::Block(parent, name) {}
-    virtual void unstall_queue(int from_x, int from_y) = 0;
-    virtual bool handle_request(FloonocNodeV2 *node, FloonocReqV2 *req, int from_x, int from_y) = 0;
-};
-
+/**
+ * Shared definitions of the v2 FlooNoC model.
+ *
+ * The mesh is assembled by the Python generator (pulp/floonoc_v2/floonoc_v2.py):
+ * routers and network interfaces are standalone components bound together with
+ * 'floonoc_link' ports (see floonoc_link_v2.hpp). This header only carries what
+ * travels or is shared between them.
+ */
 
 /**
  * Subclass of v2 vp::IoReq used to carry per-mesh metadata that the v1 model
  * stored in the IoReq arg-stack. v2 has no arg stack, so we attach the data as
- * regular fields on a subclass that the NI allocates and the router downcasts.
+ * regular fields on a subclass that the NI allocates and the routers downcast.
  */
 class FloonocReqV2 : public vp::IoReq
 {
@@ -45,11 +40,16 @@ public:
     // Destination position in the mesh
     int dest_x;
     int dest_y;
-    // Pointer to the originating NI. NULL means the request is travelling on the
-    // response path (back to the source NI).
-    NetworkInterfaceV2 *src_ni;
+    // Source NI position in the mesh. On the request path the destination NI
+    // uses it to route the response back; on the response path it is the
+    // position the response is coming back to.
+    int src_x;
+    int src_y;
+    // True if the request is travelling on the response path (back to the
+    // source NI), false on the request path (towards the target).
+    bool is_rsp;
     // Pointer back to the external IoReq (from the master) that this internal
-    // request belongs to.
+    // request belongs to. Only dereferenced by the source NI.
     vp::IoReq *burst;
     // True if the request travels on the wide network, false for narrow.
     bool wide;
@@ -72,48 +72,4 @@ public:
     int x;
     int y;
     uint64_t remove_offset;
-};
-
-
-/**
- * v2 FlooNoC top component.
- *
- * Structurally identical to v1 FlooNoc, but built on top of the v2 io protocol.
- * Instantiated indirectly through the floonoc_v2_new() factory called from the
- * shared gv_new in floonoc.cpp when use_v2_ni is set.
- */
-class FlooNocV2 : public vp::Component
-{
-public:
-    FlooNocV2(vp::ComponentConf &config);
-    ~FlooNocV2();
-
-    void reset(bool active);
-
-    EntryV2 *get_entry(uint64_t base, uint64_t size);
-
-    static constexpr int DIR_RIGHT = 0;
-    static constexpr int DIR_LEFT = 1;
-    static constexpr int DIR_UP   = 2;
-    static constexpr int DIR_DOWN = 3;
-    static constexpr int DIR_LOCAL = 4;
-
-    uint64_t wide_width;
-    uint64_t narrow_width;
-    int dim_x;
-    int dim_y;
-
-private:
-    FloonocNodeV2 *get_router_neighbour(std::vector<RouterV2 *> &routers, int x, int y);
-    void router_init_neighbours(RouterV2 *router, std::vector<RouterV2 *> &routers);
-    FloonocNodeV2 *get_node(std::vector<RouterV2 *> &routers, int x, int y);
-
-    vp::Trace trace;
-    std::vector<EntryV2> entries;
-    std::vector<std::string> itf_names;
-    int router_input_queue_size;
-    std::vector<RouterV2 *> req_routers;
-    std::vector<RouterV2 *> rsp_routers;
-    std::vector<RouterV2 *> wide_routers;
-    std::vector<NetworkInterfaceV2 *> network_interfaces;
 };

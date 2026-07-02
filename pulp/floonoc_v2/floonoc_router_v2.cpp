@@ -16,13 +16,13 @@
  */
 
 #include <vp/vp.hpp>
-#include <vp/itf/io_v2.hpp>
 #include "floonoc_v2.hpp"
 #include "floonoc_router_v2.hpp"
-#include "floonoc_network_interface_v2.hpp"
 
-RouterV2::RouterV2(FlooNocV2 *noc, std::string name, int x, int y, int queue_size)
-    : FloonocNodeV2(noc, name + std::to_string(x) + "_" + std::to_string(y)),
+static const char *dir_names[RouterV2::DIR_NB] = {"right", "left", "up", "down", "local"};
+
+RouterV2::RouterV2(vp::ComponentConf &config)
+    : vp::Component(config),
       fsm_event(this, &RouterV2::fsm_handler),
       signal_req(*this, "req", 64, vp::SignalCommon::ResetKind::HighZ),
       signal_req_size(*this, "req_size", 64, vp::SignalCommon::ResetKind::HighZ),
@@ -33,19 +33,37 @@ RouterV2::RouterV2(FlooNocV2 *noc, std::string name, int x, int y, int queue_siz
         vp::Signal<bool>(*this, "stalled_queue_up", 1),
         vp::Signal<bool>(*this, "stalled_queue_down", 1),
         vp::Signal<bool>(*this, "stalled_queue_local", 1)
+      }},
+      input_ports{{
+        FloonocLinkSlave(DIR_RIGHT, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_LEFT, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_UP, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_DOWN, &RouterV2::link_req),
+        FloonocLinkSlave(DIR_LOCAL, &RouterV2::link_req)
+      }},
+      output_ports{{
+        FloonocLinkMaster(DIR_RIGHT, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_LEFT, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_UP, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_DOWN, &RouterV2::link_unstall),
+        FloonocLinkMaster(DIR_LOCAL, &RouterV2::link_unstall)
       }}
 {
     this->traces.new_trace("trace", &trace, vp::DEBUG);
 
-    this->noc = noc;
-    this->x = x;
-    this->y = y;
-    this->queue_size = queue_size;
+    this->x = get_js_config()->get_int("x");
+    this->y = get_js_config()->get_int("y");
+    this->dim_x = get_js_config()->get_int("dim_x");
+    this->dim_y = get_js_config()->get_int("dim_y");
+    this->queue_size = get_js_config()->get_int("router_input_queue_size");
 
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < DIR_NB; i++)
     {
-        this->input_queues[i] = new RouterQueueV2(this, "input_queue_" + std::to_string(i),
+        this->input_queues[i] = new vp::Queue(this, "input_queue_" + std::to_string(i),
             &this->fsm_event);
+
+        this->new_slave_port(std::string("input_") + dir_names[i], &this->input_ports[i]);
+        this->new_master_port(std::string("output_") + dir_names[i], &this->output_ports[i]);
 
         this->stalled_queues[i] = false;
     }
@@ -53,38 +71,30 @@ RouterV2::RouterV2(FlooNocV2 *noc, std::string name, int x, int y, int queue_siz
 
 RouterV2::~RouterV2()
 {
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < DIR_NB; i++)
     {
         delete this->input_queues[i];
     }
 }
 
-void RouterV2::set_neighbour(int dir, FloonocNodeV2 *node)
+bool RouterV2::link_req(vp::Block *__this, FloonocReqV2 *req, int queue_index)
 {
-    this->output_nodes[dir] = node;
-}
+    RouterV2 *_this = (RouterV2 *)__this;
 
-bool RouterV2::handle_request(FloonocNodeV2 *node, FloonocReqV2 *req, int from_x, int from_y)
-{
-    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Handle request (req: %p, base: 0x%x, size: 0x%x, from: (%d, %d)\n", req, req->get_addr(), req->get_size(), from_x, from_y);
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Handle request (req: %p, base: 0x%x, size: 0x%x, queue: %d)\n",
+        req, req->get_addr(), req->get_size(), queue_index);
 
-    this->signal_req.set_and_release(req->initiator_addr);
-    this->signal_req_size.set_and_release(req->get_size());
-    this->signal_req_is_write.set_and_release(req->get_is_write());
+    _this->signal_req.set_and_release(req->initiator_addr);
+    _this->signal_req_size.set_and_release(req->get_size());
+    _this->signal_req_is_write.set_and_release(req->get_is_write());
 
-    int queue_index = this->get_req_queue(from_x, from_y);
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Pushed request to input queue (req: %p, queue: %d)\n",
+        req, queue_index);
 
-    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Pushed request to input queue (req: %p, queue: %d)\n", req, queue_index);
+    vp::Queue *queue = _this->input_queues[queue_index];
+    queue->push_back(req, 1);
 
-    RouterQueueV2 *queue = this->input_queues[queue_index];
-    queue->queue.push_back(req, 1);
-
-    bool stalled = queue->queue.size() > this->queue_size;
-    if (stalled)
-    {
-        queue->stalled_node = node;
-    }
-    return stalled;
+    return queue->size() > _this->queue_size;
 }
 
 void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
@@ -94,14 +104,14 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Current queue: %d\n", _this->current_queue);
     int in_queue_index = _this->current_queue;
 
-    bool output_full[5] = {false};
-    for (int i = 0; i < 5; i++)
+    bool output_full[DIR_NB] = {false};
+    for (int i = 0; i < DIR_NB; i++)
     {
-        RouterQueueV2 *queue = _this->input_queues[in_queue_index];
-        _this->trace.msg(vp::Trace::LEVEL_TRACE, "Checking input queue (queue_index: %d, queue size: %d)\n", in_queue_index, queue->queue.size());
-        if (!queue->queue.empty())
+        vp::Queue *queue = _this->input_queues[in_queue_index];
+        _this->trace.msg(vp::Trace::LEVEL_TRACE, "Checking input queue (queue_index: %d, queue size: %d)\n", in_queue_index, queue->size());
+        if (!queue->empty())
         {
-            FloonocReqV2 *req = (FloonocReqV2 *)queue->queue.head();
+            FloonocReqV2 *req = (FloonocReqV2 *)queue->head();
 
             int to_x = req->dest_x;
             int to_y = req->dest_y;
@@ -118,7 +128,7 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 _this->trace.msg(vp::Trace::LEVEL_TRACE, "Output queue is full, skipping (out queue: %d)\n", out_queue_id);
                 _this->fsm_event.enqueue();
                 in_queue_index += 1;
-                if (in_queue_index == 5)
+                if (in_queue_index == DIR_NB)
                 {
                     in_queue_index = 0;
                 }
@@ -130,31 +140,29 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             {
                 _this->trace.msg(vp::Trace::LEVEL_TRACE, "Output queue is stalled, skipping (out queue: %d)\n", out_queue_id);
                 in_queue_index += 1;
-                if (in_queue_index == 5)
+                if (in_queue_index == DIR_NB)
                 {
                     in_queue_index = 0;
                 }
                 continue;
             }
 
-            queue->queue.pop();
+            queue->pop();
 
-            if (queue->queue.size() == _this->queue_size)
+            if (queue->size() == _this->queue_size)
             {
-                queue->stalled_node->unstall_queue(_this->x, _this->y);
+                _this->input_ports[in_queue_index].unstall();
             }
-
-            FloonocNodeV2 *node = _this->output_nodes[out_queue_id];
 
             _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Forwarding request to next router (req: %p, base: 0x%x, size: 0x%x, next_position: (%d, %d), in_queue: %d)\n",
                                 req, req->get_addr(), req->get_size(), next_x, next_y, in_queue_index);
-            if (node->handle_request(_this, req, _this->x, _this->y))
+            if (_this->output_ports[out_queue_id].req(req))
             {
                 _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Stalling queue (position: (%d, %d), queue: %d)\n", _this->x, _this->y, out_queue_id);
                 _this->stalled_queues[out_queue_id] = true;
             }
             _this->current_queue = in_queue_index + 1;
-            if (_this->current_queue == 5)
+            if (_this->current_queue == DIR_NB)
             {
                 _this->current_queue = 0;
             }
@@ -163,14 +171,14 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         }
         else
         {
-            if (queue->queue.size())
+            if (queue->size())
             {
                _this->fsm_event.enqueue();
             }
         }
 
         in_queue_index += 1;
-        if (in_queue_index == 5)
+        if (in_queue_index == DIR_NB)
         {
             in_queue_index = 0;
         }
@@ -183,10 +191,10 @@ void RouterV2::get_next_router_pos(int dest_x, int dest_y, int &next_x, int &nex
     {
         switch (dest_x + 4)
         {
-            case FlooNocV2::DIR_UP: next_x = this->x; next_y = this->y + 1; break;
-            case FlooNocV2::DIR_DOWN: next_x = this->x; next_y = this->y - 1; break;
-            case FlooNocV2::DIR_RIGHT: next_y = this->y; next_x = this->x + 1; break;
-            case FlooNocV2::DIR_LEFT: next_y = this->y; next_x = this->x - 1; break;
+            case DIR_UP: next_x = this->x; next_y = this->y + 1; break;
+            case DIR_DOWN: next_x = this->x; next_y = this->y - 1; break;
+            case DIR_RIGHT: next_y = this->y; next_x = this->x + 1; break;
+            case DIR_LEFT: next_y = this->y; next_x = this->x - 1; break;
         }
     }
     else
@@ -203,7 +211,7 @@ void RouterV2::get_next_router_pos(int dest_x, int dest_y, int &next_x, int &nex
             next_x = dest_x < this->x ? this->x - 1 : this->x + 1;
             next_y = this->y;
 
-            if (next_x != 0 && next_x != this->noc->dim_x - 1 || next_y == dest_y)
+            if (next_x != 0 && next_x != this->dim_x - 1 || next_y == dest_y)
             {
                 return;
             }
@@ -214,46 +222,12 @@ void RouterV2::get_next_router_pos(int dest_x, int dest_y, int &next_x, int &nex
     }
 }
 
-void RouterV2::unstall_queue(int from_x, int from_y)
+void RouterV2::link_unstall(vp::Block *__this, int output_id)
 {
-    int queue = this->get_req_queue(from_x, from_y);
-    this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling queue (position: (%d, %d), queue: %d)\n", from_x, from_y, queue);
-    this->stalled_queues[queue] = false;
-    this->fsm_event.enqueue();
-}
-
-void RouterV2::stall_queue(int from_x, int from_y)
-{
-    int queue = this->get_req_queue(from_x, from_y);
-    this->trace.msg(vp::Trace::LEVEL_TRACE, "Stalling queue (position: (%d, %d), queue: %d)\n", from_x, from_y, queue);
-    this->stalled_queues[queue] = true;
-}
-
-void RouterV2::get_pos_from_queue(int queue, int &pos_x, int &pos_y)
-{
-    switch (queue)
-    {
-    case FlooNocV2::DIR_RIGHT:
-        pos_x = this->x + 1;
-        pos_y = this->y;
-        break;
-    case FlooNocV2::DIR_LEFT:
-        pos_x = this->x - 1;
-        pos_y = this->y;
-        break;
-    case FlooNocV2::DIR_UP:
-        pos_x = this->x;
-        pos_y = this->y + 1;
-        break;
-    case FlooNocV2::DIR_DOWN:
-        pos_x = this->x;
-        pos_y = this->y - 1;
-        break;
-    case FlooNocV2::DIR_LOCAL:
-        pos_x = this->x;
-        pos_y = this->y;
-        break;
-    }
+    RouterV2 *_this = (RouterV2 *)__this;
+    _this->trace.msg(vp::Trace::LEVEL_TRACE, "Unstalling queue (queue: %d)\n", output_id);
+    _this->stalled_queues[output_id] = false;
+    _this->fsm_event.enqueue();
 }
 
 int RouterV2::get_req_queue(int from_x, int from_y)
@@ -261,15 +235,15 @@ int RouterV2::get_req_queue(int from_x, int from_y)
     int queue_index = 0;
     if (from_x != this->x)
     {
-        queue_index = from_x < this->x ? FlooNocV2::DIR_LEFT : FlooNocV2::DIR_RIGHT;
+        queue_index = from_x < this->x ? DIR_LEFT : DIR_RIGHT;
     }
     else if (from_y != this->y)
     {
-        queue_index = from_y < this->y ? FlooNocV2::DIR_DOWN : FlooNocV2::DIR_UP;
+        queue_index = from_y < this->y ? DIR_DOWN : DIR_UP;
     }
     else
     {
-        queue_index = FlooNocV2::DIR_LOCAL;
+        queue_index = DIR_LOCAL;
     }
 
     return queue_index;
@@ -280,14 +254,14 @@ void RouterV2::reset(bool active)
     if (active)
     {
         this->current_queue = 0;
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < DIR_NB; i++)
         {
             this->stalled_queues[i] = false;
         }
     }
 }
 
-RouterQueueV2::RouterQueueV2(vp::Block *parent, std::string name, vp::ClockEvent *ready_event)
-: queue(parent, name, ready_event)
+extern "C" vp::Component *gv_new(vp::ComponentConf &config)
 {
+    return new RouterV2(config);
 }

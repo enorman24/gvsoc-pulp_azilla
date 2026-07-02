@@ -21,47 +21,59 @@
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
 #include "floonoc_v2.hpp"
+#include "floonoc_link_v2.hpp"
 
-class FlooNocV2;
-
-class RouterQueueV2
+/**
+ * One FlooNoC mesh router.
+ *
+ * Standalone component instantiated by the generator, three times per tile
+ * (one per physical network: req, rsp and wide). Five 'floonoc_link' input
+ * ports feed five input queues; a round-robin FSM forwards one request per
+ * output and per cycle to the five 'floonoc_link' output ports, following
+ * X-then-Y routing. Ports of absent neighbours (mesh edges) are simply left
+ * unbound by the generator.
+ */
+class RouterV2 : public vp::Component
 {
 public:
-    RouterQueueV2(vp::Block *parent, std::string name, vp::ClockEvent *ready_event=NULL);
-    vp::Queue queue;
-    FloonocNodeV2 *stalled_node;
-};
+    // Direction constants, used as indices for the input/output ports and
+    // queues. Must match the _DIRS list in floonoc_v2.py.
+    static constexpr int DIR_RIGHT = 0;
+    static constexpr int DIR_LEFT = 1;
+    static constexpr int DIR_UP   = 2;
+    static constexpr int DIR_DOWN = 3;
+    static constexpr int DIR_LOCAL = 4;
+    static constexpr int DIR_NB = 5;
 
-class RouterV2 : public FloonocNodeV2
-{
-public:
-    RouterV2(FlooNocV2 *noc, std::string name, int x, int y, int queue_size);
+    RouterV2(vp::ComponentConf &config);
     ~RouterV2();
 
     void reset(bool active);
 
-    bool handle_request(FloonocNodeV2 *node, FloonocReqV2 *req, int from_x, int from_y) override;
-    void unstall_queue(int from_x, int from_y) override;
-    void stall_queue(int from_x, int from_y);
-    void set_neighbour(int dir, FloonocNodeV2 *node);
-
-    int x;
-    int y;
-
 private:
+    // Link input callback: push the request into the input queue identified
+    // by the port id, return true when the queue went over capacity (the
+    // sender must then hold off until unstalled).
+    static bool link_req(vp::Block *__this, FloonocReqV2 *req, int queue_index);
+    // Link output callback: the downstream node accepts requests again on the
+    // identified output.
+    static void link_unstall(vp::Block *__this, int output_id);
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
     void get_next_router_pos(int dest_x, int dest_y, int &next_x, int &next_y);
     int get_req_queue(int from_x, int from_y);
-    void get_pos_from_queue(int queue, int &pos_x, int &pos_y);
 
-    FlooNocV2 *noc;
     vp::Trace trace;
+    int x;
+    int y;
+    int dim_x;
+    int dim_y;
     int queue_size;
-    RouterQueueV2 *input_queues[5];
-    FloonocNodeV2 *output_nodes[5];
+    vp::Queue *input_queues[DIR_NB];
+    std::array<FloonocLinkSlave, DIR_NB> input_ports;
+    std::array<FloonocLinkMaster, DIR_NB> output_ports;
     vp::ClockEvent fsm_event;
     int current_queue;
-    std::array<vp::Signal<bool>, 5> stalled_queues;
+    std::array<vp::Signal<bool>, DIR_NB> stalled_queues;
     vp::Signal<uint64_t> signal_req;
     vp::Signal<uint64_t> signal_req_size;
     vp::Signal<bool> signal_req_is_write;
