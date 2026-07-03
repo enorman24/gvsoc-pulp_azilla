@@ -17,6 +17,8 @@ else ifeq ($(CASE),mem.8)
 TARGET := $(TARGET):use_memory=true,mem_bw=8
 else ifeq ($(CASE),mem.64)
 TARGET := $(TARGET):use_memory=true,mem_bw=64
+else ifeq ($(CASE),tiles)
+TARGET := $(TARGET):use_tiles=true
 endif
 
 include $(GVSOC_ROOT)/gvsoc/core/tests/common.mk

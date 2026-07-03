@@ -75,7 +75,7 @@ class Testbench(gvsoc.systree.Component):
         limiter.o_OUTPUT(mem.i_INPUT())
         return limiter
 
-    def __init__(self, parent, name, use_memory=False, target_bw=0, mem_bw=0):
+    def __init__(self, parent, name, use_memory=False, target_bw=0, mem_bw=0, use_tiles=False):
         super().__init__(parent, name)
 
         nb_cluster_x = 3
@@ -86,7 +86,7 @@ class Testbench(gvsoc.systree.Component):
         mem_size = 0x10_0000
         mem_group_size = 0x1000_0000
 
-        noc = pulp.floonoc_v2.floonoc_v2.FlooNocV2ClusterGridNarrowWide(self, 'noc', 64, 8, nb_cluster_x, nb_cluster_y, ni_outstanding_reqs=32)
+        noc = pulp.floonoc_v2.floonoc_v2.FlooNocV2ClusterGridNarrowWide(self, 'noc', 64, 8, nb_cluster_x, nb_cluster_y, ni_outstanding_reqs=32, tiles=use_tiles)
 
         test = FloonocV2Test(self, 'test', nb_cluster_x, nb_cluster_y, cluster_base, cluster_size, use_memory, mem_bw)
 
@@ -213,8 +213,13 @@ class Chip(gvsoc.systree.Component):
             cast=int
         ).get_value()
 
+        use_tiles = TargetParameter(
+            self, name='use_tiles', value=False, description='Group each position\'s routers and NI into a tile composite',
+            cast=bool
+        ).get_value()
+
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=100000000)
-        soc = Testbench(self, 'soc', use_memory=use_memory, mem_bw=mem_bw)
+        soc = Testbench(self, 'soc', use_memory=use_memory, mem_bw=mem_bw, use_tiles=use_tiles)
         clock.o_CLOCK(soc.i_CLOCK())
 
 
