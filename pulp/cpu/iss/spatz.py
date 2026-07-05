@@ -43,15 +43,19 @@ class Spatz(RiscvCommon):
             config: SpatzConfig
         ):
 
-        isa_instance: Isa | None = isa_instances.get(config.isa)
+        # The LSU flavour (io v1 vs io_v2) adds defines to the generated ISA,
+        # so cores differing only by vlsu_v2 cannot share an Isa instance —
+        # key and name the ISA per flavour.
+        isa_key = f"{config.isa}_iov2" if config.vlsu_v2 else config.isa
+        isa_instance: Isa | None = isa_instances.get(isa_key)
 
-        if isa_instances.get(config.isa) is None:
+        if isa_instance is None:
 
             extensions = [ Xdma(), Xf16(), Xf16alt(), Xf8(), XfvecSnitch(), Xfaux() ]
 
-            isa_instance = cpu.iss.isa_gen.isa_riscv_gen.RiscvIsa("spatz_" + config.isa,
+            isa_instance = cpu.iss.isa_gen.isa_riscv_gen.RiscvIsa("spatz_" + isa_key,
                 config.isa, extensions=extensions)
-            isa_instances[config.isa] = isa_instance
+            isa_instances[isa_key] = isa_instance
 
             pulp.ara.ara_v2.extend_isa(isa_instance)
 
@@ -79,7 +83,8 @@ class Spatz(RiscvCommon):
         self._vlsu_v2 = config.vlsu_v2
 
         pulp.ara.ara_v2.attach(self, config.vlen, nb_lanes=config.nb_lanes, use_spatz=True,
-            lane_width=config.lane_width, vlsu_v2=config.vlsu_v2)
+            lane_width=config.lane_width, vlsu_v2=config.vlsu_v2,
+            nb_outstanding_reqs=config.nb_outstanding_reqs)
 
 
     def o_BARRIER_REQ(self, itf: gvsoc.systree.SlaveItf):

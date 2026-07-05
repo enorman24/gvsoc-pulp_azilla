@@ -121,7 +121,6 @@ class SnitchDmaV2(gvsoc.systree.Component):
             'ips/pulp/idma_v2/me/idma_me_2d.cpp',
             'ips/pulp/idma_v2/be/idma_be.cpp',
             'ips/pulp/idma_v2/be/idma_be_axi.cpp',
-            'utils/io_v2_beat_adapter.cpp',
         ])
 
         self.add_properties({

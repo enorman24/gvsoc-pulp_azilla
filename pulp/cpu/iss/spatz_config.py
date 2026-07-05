@@ -39,3 +39,8 @@ class SpatzConfig(RiscvConfig):
         "Selecting this also forces the scalar data LSU to its v2 variant "
         "since both share the same ISS translation unit."
     ))
+    nb_outstanding_reqs: int = cfg_field(default=8, dump=True, desc=(
+        "Depth of the per-port VLSU outstanding-request queue (reorder "
+        "buffer). Matches num_spatz_outstanding_loads in the RTL cluster "
+        "config (4 in the default spatz_cluster configuration)."
+    ))
