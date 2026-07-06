@@ -76,15 +76,23 @@ vp::IoReqStatus IDmaFeReg::req(vp::Block *__this, vp::IoReq *req)
 
         case 0x10:
         {
-            bool granted;
             _this->trace.msg(vp::Trace::LEVEL_TRACE, "Trigger transfer\n");
-            *(uint32_t *)req->get_data() = _this->enqueue_copy(granted);
-            // In case the transfer is not granted, it is just ignored, it is up to the SW to make
-            // sure we never overflow the queue
-            if (!granted)
+            // A zero-size (or zero-rep 2D) transfer moves no data and needs no
+            // mid-end slot, so it always completes immediately. Any other
+            // transfer needs the mid-end to accept it; if it cannot right now,
+            // back-pressure the trigger (return DENIED) and re-send it via
+            // retry() once the mid-end is ready. This mirrors the HW register
+            // frontend, whose next_id read stalls until the backend grants, so
+            // the transfer queue can never silently overflow.
+            bool zero_size = _this->length.get() == 0 || _this->reps.get() == 0;
+            if (!zero_size && !_this->me->can_accept_transfer())
             {
-                _this->trace.force_warning("Pushing transfer while the queue is already full");
+                _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "Middle-end not ready, back-pressuring trigger\n");
+                _this->do_transfer_grant.set(true);   // retry pending
+                return vp::IO_REQ_DENIED;
             }
+            *(uint32_t *)req->get_data() = _this->enqueue_copy();
             break;
         }
 
@@ -129,7 +137,7 @@ vp::IoReqStatus IDmaFeReg::req(vp::Block *__this, vp::IoReq *req)
 
 
 
-uint32_t IDmaFeReg::enqueue_copy(bool &granted)
+uint32_t IDmaFeReg::enqueue_copy()
 {
     // Allocate transfer ID
     uint32_t transfer_id = this->next_transfer_id.get();
@@ -161,34 +169,17 @@ uint32_t IDmaFeReg::enqueue_copy(bool &granted)
         transfer_id, transfer->src, transfer->dst, transfer->size, transfer->src_stride,
         transfer->dst_stride, transfer->reps, transfer->config);
 
-    // In case size is 0 or reps is 0 with 2d transfer, directly terminate the transfer.
-    // This could be done few cycles after to better match HW.
+    // In case size is 0 or reps is 0 with 2d transfer, directly terminate the
+    // transfer: there is just no data to move.
     if (this->length == 0 || ((transfer->config >> 1) & 1) && transfer->reps == 0)
     {
-        // The trigger is still accepted — there is just no data to move.
-        // Without this, the caller treats `granted` as false and prints the
-        // "queue already full" warning, which becomes fatal under werror.
-        granted = true;
         this->ack_transfer(transfer);
         return transfer_id;
     }
 
-    // Check if middle end can accept a new transfer
-    if (this->me->can_accept_transfer())
-    {
-        // If no enqueue the burst
-        granted = true;
-        this->me->enqueue_transfer(transfer);
-    }
-    else
-    {
-        // Otherwise, stall the core and keep the transfer until we can grant it
-        this->trace.msg(vp::Trace::LEVEL_TRACE, "Middle-end not ready, blocking transfer\n");
-        this->stalled_transfer = transfer;
-        granted = false;
-
-        this->do_transfer_grant.set(true);
-    }
+    // The caller only reaches here once the mid-end has been checked to accept
+    // (non-accepting triggers are back-pressured with IO_REQ_DENIED instead).
+    this->me->enqueue_transfer(transfer);
 
     return transfer_id;
 }
@@ -217,17 +208,16 @@ void IDmaFeReg::ack_transfer(IdmaTransfer *transfer)
 // Called by middle-end when something has been updated to check if we must take any action
 void IDmaFeReg::update()
 {
-    // In case a transfer is blocked and the middle-end is now ready, unblock it and grant it
-    // to unstall the core
+    // If a trigger was back-pressured (DENIED) and the middle-end can now
+    // accept, re-send it: retry() re-submits the held trigger request
+    // synchronously, so req() runs again and this time enqueues it.
     if (this->do_transfer_grant.get() && this->me->can_accept_transfer())
     {
         this->do_transfer_grant.set(false);
 
-        this->trace.msg(vp::Trace::LEVEL_TRACE, "Middle-end got ready, unblocking transfer\n");
+        this->trace.msg(vp::Trace::LEVEL_TRACE, "Middle-end got ready, retrying trigger\n");
 
-        IdmaTransfer *transfer = this->stalled_transfer;
-
-        this->me->enqueue_transfer(transfer);
+        this->input_itf.retry();
     }
 }
 

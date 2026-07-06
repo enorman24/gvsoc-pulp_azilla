@@ -51,8 +51,10 @@ public:
 private:
     // Handle register accesses here
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
-    // Enqueue a transfer using the current values of the registers
-    uint32_t enqueue_copy(bool &granted);
+    // Enqueue a transfer using the current values of the registers. Only
+    // called once the mid-end is known to accept it (or it is a zero-size
+    // transfer); returns the allocated transfer ID.
+    uint32_t enqueue_copy();
 
     // Pointer to middle-end
     IdmaTransferConsumer *me;
