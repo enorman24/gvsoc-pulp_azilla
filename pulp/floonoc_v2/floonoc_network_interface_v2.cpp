@@ -82,6 +82,7 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
     uint64_t burst_base = req->get_addr();
     uint64_t burst_size = req->get_size();
     uint8_t *burst_data = req->get_data();
+    bool is_first_flit = true;
 
     while(burst_size > 0)
     {
@@ -96,6 +97,12 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         FloonocReqV2 *router_req = new FloonocReqV2();
 
         router_req->prepare();
+        // Wormhole packet framing: a header (AR/AW) is a single-flit packet;
+        // the data phase is one packet spanning all its beat flits. is_first
+        // marks the head; is_last (set below, after the size is finalised)
+        // marks the tail and releases the router output lock.
+        router_req->is_first = is_first_flit;
+        is_first_flit = false;
         router_req->src_x = this->ni.x;
         router_req->src_y = this->ni.y;
         router_req->is_rsp = false;
@@ -144,6 +151,9 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
             router_req->dest_y = entry->y;
         }
 
+        // Tail flit once this beat consumes the rest of the burst.
+        router_req->is_last = (burst_size <= size);
+
         this->queue.push(router_req);
 
         burst_base += size;
@@ -162,6 +172,13 @@ void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
     FloonocReqV2 *router_req = new FloonocReqV2();
 
     router_req->prepare();
+    // Wormhole packet framing on the response path. A read response is a
+    // multi-beat packet whose per-beat is_first/is_last framing was folded
+    // onto `req` by unwrap_response; carry it onto the rsp flit so the routers
+    // keep the response's beats contiguous. A write ack (is_address) is a
+    // single-flit packet.
+    router_req->is_first = is_address ? true : req->is_first;
+    router_req->is_last  = is_address ? true : req->is_last;
     router_req->src_x = req->src_x;
     router_req->src_y = req->src_y;
     router_req->is_rsp = true;
@@ -499,7 +516,14 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
                 &this->narrow_read_pending_burst;
     }
 
-    if (*queue || this->nb_pending_bursts[wide] >= this->ni_outstanding_reqs)
+    // Admission is bounded only by the number of outstanding bursts, matching
+    // the RTL chimney's MaxTxns semantics. We deliberately do NOT serialize on
+    // the previous burst finishing its fragmentation into router flits: that
+    // coupling made admission stall whenever the downstream router was
+    // back-pressured (a hotspot), starving the sources closest to the jam in
+    // periodic bubbles the RTL does not have. The per-burst pointer below is
+    // kept only as an aggregate drain-wakeup helper (see fsm_handler).
+    if (this->nb_pending_bursts[wide] >= this->ni_outstanding_reqs)
     {
         // v2 deny: do not queue. Remember that the master is owed a retry()
         // when capacity returns.
@@ -697,19 +721,17 @@ void NetworkInterfaceV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     }
 
     // v2 deny/retry: if a master was previously denied and we now have capacity
-    // on the corresponding external slave port, call retry() once. The master
-    // will re-issue when it sees the retry callback.
+    // (an outstanding burst completed), call retry() once. The master will
+    // re-issue when it sees the retry callback. Mirrors the admission gate
+    // above: retry as soon as nb_pending_bursts drops below the limit, without
+    // waiting for any in-flight fragmentation to drain.
     if (_this->owes_retry_wide_input &&
-        _this->wide_read_pending_burst == NULL &&
-        _this->wide_write_pending_burst == NULL &&
         _this->nb_pending_bursts[1] < _this->ni_outstanding_reqs)
     {
         _this->owes_retry_wide_input = false;
         _this->wide_input_itf.retry();
     }
     if (_this->owes_retry_narrow_input &&
-        _this->narrow_read_pending_burst == NULL &&
-        _this->narrow_write_pending_burst == NULL &&
         _this->nb_pending_bursts[0] < _this->ni_outstanding_reqs)
     {
         _this->owes_retry_narrow_input = false;

@@ -123,6 +123,23 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             int out_queue_id = _this->get_req_queue(next_x, next_y);
 
+            // Wormhole: an output mid-packet is reserved for its owning input.
+            // A flit from any other input must wait until the owner passes its
+            // tail flit and releases the output.
+            if (_this->output_owner[out_queue_id] != -1 &&
+                _this->output_owner[out_queue_id] != in_queue_index)
+            {
+                _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                    "Output locked to another input, skipping (out queue: %d, owner: %d)\n",
+                    out_queue_id, _this->output_owner[out_queue_id]);
+                in_queue_index += 1;
+                if (in_queue_index == DIR_NB)
+                {
+                    in_queue_index = 0;
+                }
+                continue;
+            }
+
             if (output_full[out_queue_id])
             {
                 _this->trace.msg(vp::Trace::LEVEL_TRACE, "Output queue is full, skipping (out queue: %d)\n", out_queue_id);
@@ -153,6 +170,11 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             {
                 _this->input_ports[in_queue_index].unstall();
             }
+
+            // Wormhole: lock the output to this input for the rest of the
+            // packet; release it once the tail (is_last) flit is forwarded. A
+            // single-flit packet (is_first && is_last) leaves it free.
+            _this->output_owner[out_queue_id] = req->is_last ? -1 : in_queue_index;
 
             _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Forwarding request to next router (req: %p, base: 0x%x, size: 0x%x, next_position: (%d, %d), in_queue: %d)\n",
                                 req, req->get_addr(), req->get_size(), next_x, next_y, in_queue_index);
@@ -257,6 +279,7 @@ void RouterV2::reset(bool active)
         for (int i = 0; i < DIR_NB; i++)
         {
             this->stalled_queues[i] = false;
+            this->output_owner[i] = -1;
         }
     }
 }

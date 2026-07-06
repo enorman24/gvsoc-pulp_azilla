@@ -73,6 +73,13 @@ private:
     std::array<FloonocLinkMaster, DIR_NB> output_ports;
     vp::ClockEvent fsm_event;
     int current_queue;
+    // Wormhole arbitration: each output, once a packet's head flit wins it,
+    // is locked to the winning INPUT port until that input passes the tail
+    // (is_last) flit; other inputs targeting a locked output must wait. -1
+    // means the output is free. Input-keyed (not packet-keyed) mirrors the
+    // RTL floo wormhole arbiter and cannot head-of-line deadlock, since each
+    // physical link delivers one packet's flits contiguously.
+    int output_owner[DIR_NB];
     std::array<vp::Signal<bool>, DIR_NB> stalled_queues;
     vp::Signal<uint64_t> signal_req;
     vp::Signal<uint64_t> signal_req_size;
