@@ -35,6 +35,11 @@ class Ri5kyTestbench(Component):
     runs on both simulators.
     """
 
+    # Core model of the testbench. Variant boards (e.g. the DBT-driven
+    # one) subclass and override it; the class must accept the Ri5ky
+    # constructor signature.
+    core_class: type[Component] = Ri5ky
+
     def __init__(self, parent: Component, name: str, config: Ri5kyTestbenchConfig):
         super().__init__(parent, name, config=config)
 
@@ -55,7 +60,7 @@ class Ri5kyTestbench(Component):
         async_mem = Ri5kyAsyncMem ( self, 'async_mem', config=config.async_mem )
         mmio      = Ri5kyMmio    ( self, 'mmio'                                )
         ico       = Router       ( self, 'ico'      , config=config.router    )
-        core      = Ri5ky        ( self, 'core'     , config=config.core      )
+        core      = type(self).core_class ( self, 'core', config=config.core  )
         loader    = ElfLoader    ( self, 'loader'                             )
 
         ico.o_MAP        ( mem.i_INPUT()       , mapping=config.mem_mapping       )
@@ -86,13 +91,16 @@ class Ri5kyTestbench(Component):
 
 class Ri5kyTestbenchBoard(Component):
 
+    # See Ri5kyTestbench.core_class.
+    soc_class: type[Component] = Ri5kyTestbench
+
     def __init__(self, parent: Component, name: str, config: Ri5kyTestbenchBoardConfig):
 
         super().__init__(parent, name, config=config)
 
         self.set_target_name('ri5ky.testbench')
 
-        clock = Clock_domain  ( self, 'clock', frequency=config.frequency )
-        soc   = Ri5kyTestbench( self, 'soc',   config.soc                 )
+        clock = Clock_domain ( self, 'clock', frequency=config.frequency )
+        soc   = type(self).soc_class ( self, 'soc', config.soc           )
 
         clock.o_CLOCK ( soc.i_CLOCK() )

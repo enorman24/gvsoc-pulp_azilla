@@ -78,7 +78,8 @@ class Ri5ky(RiscvCommon):
     isa_name: str = 'ri5ky'
 
     def __init__(self, parent: Component, name: str, config: Ri5kyConfig,
-                 extra_extensions: Iterable[IsaSubset] = ()):
+                 extra_extensions: Iterable[IsaSubset] = (),
+                 exec_module: IssModule | None = None):
 
         cache_key = (type(self).isa_name, config.isa)
         isa_instance: Isa | None = isa_instances.get(cache_key)
@@ -107,7 +108,7 @@ class Ri5ky(RiscvCommon):
             'irq': IrqExternal(),
             'event': Ri5kyEvent(),
             'csr': Ri5kyCsr(),
-            'exec': Ri5kyExec(),
+            'exec': Ri5kyExec() if exec_module is None else exec_module,
             # LSU is single-issue at the request level. Ri5kyExec's
             # inorder_commit=True path absorbs the back-to-back-load case
             # (same-cycle re-dispatch in insn_terminate) so a stalled
