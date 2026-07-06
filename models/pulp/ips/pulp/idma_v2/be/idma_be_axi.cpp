@@ -137,6 +137,12 @@ uint64_t IDmaBeAxi::get_burst_size(uint64_t base, uint64_t size)
 {
     size = std::min(size, (uint64_t)AXI_PAGE_SIZE);
 
+    // AXI limits a burst to 256 beats (AxLEN <= 255), so a burst can carry at
+    // most 256 * axi_width bytes. Without this the backend would emit
+    // AXI-illegal >256-beat bursts (e.g. 512 beats on a 64-bit bus for a 4 KiB
+    // page), which also mis-sizes the outstanding-transaction granularity.
+    size = std::min(size, (uint64_t)256 * (uint64_t)this->axi_width);
+
     if (this->burst_size > 0)
     {
         size = std::min(size, (uint64_t)this->burst_size);
