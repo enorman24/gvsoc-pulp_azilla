@@ -82,7 +82,8 @@ class FloonocNetworkInterfaceV2(gvsoc.systree.Component):
     """
 
     def __init__(self, parent: gvsoc.systree.Component, name, x: int, y: int,
-            narrow_width: int, wide_width: int, ni_outstanding_reqs: int):
+            narrow_width: int, wide_width: int, ni_outstanding_reqs: int,
+            max_burst_size: int=4096):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/floonoc_v2/floonoc_network_interface_v2.cpp'])
@@ -95,6 +96,12 @@ class FloonocNetworkInterfaceV2(gvsoc.systree.Component):
         self.add_property('narrow_width', narrow_width)
         self.add_property('wide_width', wide_width)
         self.add_property('ni_outstanding_reqs', ni_outstanding_reqs)
+        # Largest input burst the NI accepts, and the boundary a burst may not
+        # cross (the AXI 4 KB rule). Guarantees a burst targets a single mesh
+        # position, so a wormhole packet is always single-destination. Checked
+        # against the memory map at construction and against each request at
+        # runtime (asserts builds). 0 disables the checks.
+        self.add_property('max_burst_size', max_burst_size)
 
     def i_NARROW_INPUT(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'narrow_input', signature=IoV2Beat(self.narrow_width))
@@ -158,7 +165,7 @@ class FlooNocV2MeshFabric:
 
     def __init__(self, container: gvsoc.systree.Component, narrow_width: int, wide_width: int,
             dim_x: int, dim_y: int, ni_outstanding_reqs: int=8, router_input_queue_size: int=2,
-            mappings: dict=None):
+            mappings: dict=None, max_burst_size: int=4096):
         self.container = container
         self.narrow_width = narrow_width
         self.wide_width = wide_width
@@ -166,6 +173,7 @@ class FlooNocV2MeshFabric:
         self.dim_y = dim_y
         self.ni_outstanding_reqs = ni_outstanding_reqs
         self.router_input_queue_size = router_input_queue_size
+        self.max_burst_size = max_burst_size
 
         # Memory map, name -> {base, size, x, y, remove_offset}. Distributed to
         # every NI in finalize(), so entries can keep being added after
@@ -249,11 +257,13 @@ class FlooNocV2MeshFabric:
         if tile_comp is None:
             ni = FloonocNetworkInterfaceV2(self.container, f'ni_{x}_{y}', x=x, y=y,
                 narrow_width=self.narrow_width, wide_width=self.wide_width,
-                ni_outstanding_reqs=self.ni_outstanding_reqs)
+                ni_outstanding_reqs=self.ni_outstanding_reqs,
+                max_burst_size=self.max_burst_size)
         else:
             ni = FloonocNetworkInterfaceV2(tile_comp, 'ni', x=x, y=y,
                 narrow_width=self.narrow_width, wide_width=self.wide_width,
-                ni_outstanding_reqs=self.ni_outstanding_reqs)
+                ni_outstanding_reqs=self.ni_outstanding_reqs,
+                max_burst_size=self.max_burst_size)
             tile_comp.ni = ni
 
             # Chain the NI's external ports through the tile.
@@ -422,7 +432,8 @@ class FlooNocV22dMeshNarrowWide(gvsoc.systree.Component):
     is_first/is_last/burst_id and the retry() deny handshake.
     """
     def __init__(self, parent: gvsoc.systree.Component, name, narrow_width: int, wide_width:int,
-            dim_x: int, dim_y:int, ni_outstanding_reqs: int=8, router_input_queue_size: int=2):
+            dim_x: int, dim_y:int, ni_outstanding_reqs: int=8, router_input_queue_size: int=2,
+            max_burst_size: int=4096):
         super().__init__(parent, name)
 
         self.add_property('mappings', {})
@@ -441,7 +452,7 @@ class FlooNocV22dMeshNarrowWide(gvsoc.systree.Component):
             wide_width=wide_width, dim_x=dim_x, dim_y=dim_y,
             ni_outstanding_reqs=ni_outstanding_reqs,
             router_input_queue_size=router_input_queue_size,
-            mappings=self.get_property('mappings'))
+            mappings=self.get_property('mappings'), max_burst_size=max_burst_size)
 
     def __add_mapping(self, name: str, base: int, size: int, x: int, y: int, remove_offset:int =0):
         self._fabric.add_mapping(name, base=base, size=size, x=x, y=y, remove_offset=remove_offset)
@@ -516,11 +527,11 @@ class FlooNocV2ClusterGridNarrowWide(FlooNocV22dMeshNarrowWide):
     """
     def __init__(self, parent: gvsoc.systree.Component, name, wide_width: int, narrow_width:int, nb_x_clusters: int,
             nb_y_clusters, router_input_queue_size=2, ni_outstanding_reqs: int=2,
-            tiles: bool=False):
+            tiles: bool=False, max_burst_size: int=4096):
         super().__init__(parent, name, wide_width=wide_width, narrow_width=narrow_width,
             dim_x=nb_x_clusters+2, dim_y=nb_y_clusters+2,
             router_input_queue_size=router_input_queue_size,
-            ni_outstanding_reqs=ni_outstanding_reqs)
+            ni_outstanding_reqs=ni_outstanding_reqs, max_burst_size=max_burst_size)
 
         def tile_name(x, y):
             return f'tile_{x}_{y}' if tiles else None

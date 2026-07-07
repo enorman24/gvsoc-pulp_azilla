@@ -105,6 +105,9 @@ private:
     EntryV2 *get_entry(uint64_t base, uint64_t size);
 
     int ni_outstanding_reqs;
+    // Max input burst size / boundary a burst may not cross (AXI 4KB rule); 0
+    // disables the burst-legality checks.
+    uint64_t max_burst_size;
     int x;
     int y;
     uint64_t narrow_width;

@@ -16,6 +16,7 @@
  */
 
 #include <string>
+#include <climits>
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 #include "floonoc_v2.hpp"
@@ -64,6 +65,12 @@ void NetworkQueueV2::handle_req(vp::IoReq *req, bool wide)
     // router_reqs. The destination NI uses router_req->wide to pick which
     // target (wide_output_itf vs narrow_output_itf) to forward to, so it must
     // match the input port, not the carrier network.
+    //
+    // enqueue_router_req frames wormhole packets by destination run: the write
+    // data (W beats) to one mesh position stay contiguous (matching the RTL
+    // chimney, where the id-less AXI W beats must not interleave), while the
+    // address header and any entry-boundary-crossing fragments become their own
+    // single-flit packets. Reads (AR) are single-flit and never lock.
     this->enqueue_router_req(req, true, wide, true);
     if (req->get_is_write())
     {
@@ -82,7 +89,9 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
     uint64_t burst_base = req->get_addr();
     uint64_t burst_size = req->get_size();
     uint8_t *burst_data = req->get_data();
-    bool is_first_flit = true;
+    // Previous flit's destination, for dest-run packet framing below. INT_MIN
+    // sentinel so the first flit always opens a run.
+    int prev_dest_x = INT_MIN, prev_dest_y = INT_MIN;
 
     while(burst_size > 0)
     {
@@ -97,12 +106,6 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         FloonocReqV2 *router_req = new FloonocReqV2();
 
         router_req->prepare();
-        // Wormhole packet framing: a header (AR/AW) is a single-flit packet;
-        // the data phase is one packet spanning all its beat flits. is_first
-        // marks the head; is_last (set below, after the size is finalised)
-        // marks the tail and releases the router output lock.
-        router_req->is_first = is_first_flit;
-        is_first_flit = false;
         router_req->src_x = this->ni.x;
         router_req->src_y = this->ni.y;
         router_req->is_rsp = false;
@@ -134,25 +137,38 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
             this->trace.msg(vp::Trace::LEVEL_ERROR, "No entry found for base 0x%x\n", burst_base);
             return;
         }
-        else
-        {
-            uint64_t max_size = entry->base + entry->size - burst_base;
-            size = std::min(max_size, size);
+        uint64_t entry_end = entry->base + entry->size;
+        uint64_t max_size = entry_end - burst_base;
+        size = std::min(max_size, size);
 
-            this->trace.msg(vp::Trace::LEVEL_TRACE,
-                "Enqueue request to router (req: %p, base: 0x%x, size: 0x%x, "
-                "destination: (%d, %d))\n",
-                router_req, burst_base, size, entry->x, entry->y);
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "Enqueue request to router (req: %p, base: 0x%x, size: 0x%x, "
+            "destination: (%d, %d))\n",
+            router_req, burst_base, size, entry->x, entry->y);
 
-            router_req->set_size(size);
-            router_req->set_addr(burst_base - entry->remove_offset);
-            router_req->initiator_addr = burst_base;
-            router_req->dest_x = entry->x;
-            router_req->dest_y = entry->y;
-        }
+        router_req->set_size(size);
+        router_req->set_addr(burst_base - entry->remove_offset);
+        router_req->initiator_addr = burst_base;
+        router_req->dest_x = entry->x;
+        router_req->dest_y = entry->y;
 
-        // Tail flit once this beat consumes the rest of the burst.
-        router_req->is_last = (burst_size <= size);
+        // Wormhole packet framing by DESTINATION run: a packet may only span
+        // flits going to the same mesh position, because it reserves a router
+        // output along one route until its tail flit. A burst that crosses a
+        // memory-map entry boundary (e.g. a 256KB transfer spilling across
+        // 64KB per-node regions) fragments into flits with different dests —
+        // each same-dest run is its own packet. Framing this way (rather than
+        // one packet per burst) is what stops the head flit of one run from
+        // leaking a lock on an output the tail flit — bound elsewhere — never
+        // releases. is_first opens a run when the dest changes; is_last closes
+        // it when the burst ends or the next flit would cross into a new entry.
+        bool dest_changed = (entry->x != prev_dest_x || entry->y != prev_dest_y);
+        bool reached_entry_end = (burst_base + size >= entry_end);
+        bool burst_ends = (burst_size <= size);
+        router_req->is_first = dest_changed;
+        router_req->is_last = burst_ends || reached_entry_end;
+        prev_dest_x = entry->x;
+        prev_dest_y = entry->y;
 
         this->queue.push(router_req);
 
@@ -172,13 +188,13 @@ void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
     FloonocReqV2 *router_req = new FloonocReqV2();
 
     router_req->prepare();
-    // Wormhole packet framing on the response path. A read response is a
-    // multi-beat packet whose per-beat is_first/is_last framing was folded
-    // onto `req` by unwrap_response; carry it onto the rsp flit so the routers
-    // keep the response's beats contiguous. A write ack (is_address) is a
-    // single-flit packet.
-    router_req->is_first = is_address ? true : req->is_first;
-    router_req->is_last  = is_address ? true : req->is_last;
+    // Response flits are single-flit packets, mirroring the RTL chimney: R
+    // beats set hdr.last=1 on every beat ("no reason to do wormhole routing for
+    // R bursts" — floo_axi_chimney) and the B ack is a lone flit. Read data
+    // therefore never holds a router output across the holes the (slow) target
+    // leaves between beats; only writes (AW+W) are wormhole packets.
+    router_req->is_first = true;
+    router_req->is_last  = true;
     router_req->src_x = req->src_x;
     router_req->src_y = req->src_y;
     router_req->is_rsp = true;
@@ -271,6 +287,7 @@ NetworkInterfaceV2::NetworkInterfaceV2(vp::ComponentConf &config)
     this->narrow_width = get_js_config()->get_uint("narrow_width");
     this->wide_width = get_js_config()->get_uint("wide_width");
     this->ni_outstanding_reqs = get_js_config()->get_int("ni_outstanding_reqs");
+    this->max_burst_size = get_js_config()->get_uint("max_burst_size");
 
     this->new_master_port("wide_output", &this->wide_output_itf);
     this->new_master_port("narrow_output", &this->narrow_output_itf);
@@ -307,6 +324,32 @@ NetworkInterfaceV2::NetworkInterfaceV2(vp::ComponentConf &config)
             entry.y = map_y;
             entry.remove_offset = remove_offset;
             this->entries.push_back(entry);
+        }
+    }
+
+    // AXI-style burst legality: a burst may not cross a max_burst_size boundary
+    // (the 4KB rule), so it always targets a single mesh position and every
+    // wormhole packet is single-destination. For that to hold, no two targets
+    // may share a max_burst_size-aligned page. We enforce it the simple way:
+    // require every target to be aligned to and a multiple of max_burst_size, so
+    // each occupies whole pages and can never share one with another. That is
+    // how real AXI slave regions are laid out anyway. Config error, so always
+    // active (not just in asserts builds).
+    if (this->max_burst_size > 0)
+    {
+        for (EntryV2 &e : this->entries)
+        {
+            if (e.size == 0)
+            {
+                continue;
+            }
+            if (e.base % this->max_burst_size != 0 || e.size % this->max_burst_size != 0)
+            {
+                this->trace.fatal("Target (%d,%d) [0x%lx..0x%lx] is not aligned to and a "
+                    "multiple of max_burst_size=0x%lx; targets must not share a page so a "
+                    "burst always lands in one target\n", e.x, e.y, e.base,
+                    e.base + e.size - 1, this->max_burst_size);
+            }
         }
     }
 }
@@ -496,6 +539,20 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
     this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received request from target (req: %p, base: 0x%x, size: 0x%x, wide: %d)\n",
         req, req->get_addr(), req->get_size(), wide);
 
+    // AXI burst legality (asserts builds only): a burst must fit in max_burst_size
+    // and must not cross a max_burst_size boundary, so it lands in a single page
+    // and hence a single target — keeping every wormhole packet single-dest.
+    if (this->max_burst_size > 0)
+    {
+        uint64_t base = req->get_addr(), size = req->get_size();
+        this->traces.assert(size <= this->max_burst_size,
+            "Input burst size 0x%lx exceeds max_burst_size 0x%lx (addr 0x%lx)",
+            size, this->max_burst_size, base);
+        this->traces.assert(size == 0 || (base % this->max_burst_size) + size <= this->max_burst_size,
+            "Input burst [0x%lx..0x%lx] crosses a max_burst_size=0x%lx boundary (AXI 4KB rule)",
+            base, base + size - 1, this->max_burst_size);
+    }
+
     // Use the v2 IoReq remaining_size field to track how many bytes still need
     // to be returned through the mesh before we can ack the burst.
     req->remaining_size = req->get_size();
@@ -624,6 +681,16 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
                 req, req->get_addr(), req->get_size());
 
             req->prepare();
+            // The is_first/is_last on this flit are the mesh wormhole packet
+            // framing (set by enqueue_router_req/rsp); prepare() preserves them.
+            // They must NOT leak into the io_v2 beat protocol used towards the
+            // local target: the beat-to-single-req adapter reads is_first/is_last
+            // to delimit a submission, and a mid-packet frame here would make it
+            // complete the write early — the ack then frees the burst while the
+            // source still has flits queued referencing it (SIGSEGV). Present
+            // each forwarded flit as a self-contained single-beat submission.
+            req->is_first = true;
+            req->is_last = true;
             // Initiator-owned request convention: a beat target answers an async
             // read with DISTINCT response beat objects (not this request reused).
             // Point initiator at ourselves so each response beat carries a back-ref

@@ -129,9 +129,10 @@ void RouterV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             if (_this->output_owner[out_queue_id] != -1 &&
                 _this->output_owner[out_queue_id] != in_queue_index)
             {
-                _this->trace.msg(vp::Trace::LEVEL_TRACE,
+                int owner = _this->output_owner[out_queue_id];
+                _this->trace.msg(vp::Trace::LEVEL_DEBUG,
                     "Output locked to another input, skipping (out queue: %d, owner: %d)\n",
-                    out_queue_id, _this->output_owner[out_queue_id]);
+                    out_queue_id, owner);
                 in_queue_index += 1;
                 if (in_queue_index == DIR_NB)
                 {

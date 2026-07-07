@@ -78,7 +78,7 @@ class Testbench(gvsoc.systree.Component):
             self.__init_2nodes(topology)
 
     def __add_node(self, test, node, gen_itf, rcv_itf):
-        generator = GeneratorV2(self, f'generator_{node}')
+        generator = GeneratorV2(self, f'generator_{node}', max_burst_size=4096)
         generator.o_OUTPUT(gen_itf)
         receiver = ReceiverV2(self, f'receiver_{node}', mem_size=NODE_SIZE)
         rcv_itf(receiver.i_INPUT())
