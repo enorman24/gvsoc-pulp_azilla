@@ -117,4 +117,5 @@ class Ri5ky(RiscvCommon):
             'regfile': Regfile(scoreboard=True),
             'hwloop': Hwloop(),
         }
-        super().__init__(parent, name, config=config, isa=isa_instance, modules=modules)
+        super().__init__(parent, name, config=config, isa=isa_instance, modules=modules,
+                         stack_checker=True)
