@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <vector>
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 
@@ -58,6 +59,20 @@ public:
     bool is_address;
     // Pre-translation address, used for VCD traces in the routers.
     uint64_t initiator_addr;
+    // Payload storage for read-response flits. Read burst requests are
+    // data-less (io_v2 beat protocol) and the target's response beats are
+    // pooled objects recycled as soon as they are consumed, so a response
+    // flit must carry its data slice across the mesh by value — like the RTL
+    // chimney's R flits. Write flits keep pointing into the master's buffer
+    // (valid until the B ack round-trips) and leave this empty.
+    std::vector<uint8_t> payload;
+
+    // Point this flit's data at its own payload, filled from `data`.
+    void set_payload(uint8_t *data, uint64_t size)
+    {
+        this->payload.assign(data, data + size);
+        this->set_data(this->payload.data());
+    }
 };
 
 

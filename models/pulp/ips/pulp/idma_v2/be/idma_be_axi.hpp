@@ -105,10 +105,10 @@ private:
         int next_beat_idx = 0;
         // Pre-allocated beat pool used by writes (one slot per cycle).
         std::vector<vp::IoReq> beats;
-        // Read request: a single full-size IoReq per burst, heap-allocated so
-        // the consuming side (slave or auto-inserted beat adapter) owns and
-        // frees it like any other request. Held here only across a DENIED retry;
-        // cleared to nullptr once the bus accepts it (ownership handed off).
+        // Read request: a single full-size, data-less IoReq per burst, drawn
+        // from the shared IoReqAllocator (payload size 0). We own it
+        // (initiator-owned convention) for the whole transaction and free it
+        // back to its pool on the burst's last read response.
         vp::IoReq *read_req = nullptr;
         bool is_write = false;
     };
@@ -141,6 +141,10 @@ private:
     int axi_width;           // beat size in bytes
     int burst_size;          // optional cap on a logical burst size (0 = no cap)
     int burst_queue_size;    // number of in-flight bursts (slot count)
+
+    // Shared data-less request pool (payload size 0) serving the whole-burst
+    // read requests.
+    vp::IoReqAllocator *req_allocator = nullptr;
 
     // Slot pool: one BurstInfo per slot. Indexed by slot id, which is also the
     // burst_id we tag every beat with.

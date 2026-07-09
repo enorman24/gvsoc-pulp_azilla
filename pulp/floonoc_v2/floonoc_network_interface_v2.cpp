@@ -17,6 +17,7 @@
 
 #include <string>
 #include <climits>
+#include <cstring>
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
 #include "floonoc_v2.hpp"
@@ -113,7 +114,11 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         router_req->is_address = is_address;
         router_req->wide = wide;
         router_req->set_size(size);
-        router_req->set_data(burst_data);
+        // Address headers (AR/AW) carry no data. Read bursts are data-less
+        // anyway (io_v2 beat protocol: the data comes back inside the
+        // response flits); W data flits point into the master's buffer, which
+        // stays valid until the B ack round-trips.
+        router_req->set_data(is_address ? NULL : burst_data);
         router_req->set_addr(burst_base);
         router_req->set_is_write(req->get_is_write());
         router_req->set_opcode(req->get_opcode());
@@ -173,7 +178,10 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         this->queue.push(router_req);
 
         burst_base += size;
-        burst_data += size;
+        if (burst_data != NULL)
+        {
+            burst_data += size;
+        }
         burst_size -= size;
     }
     this->ni.fsm_event.enqueue();
@@ -205,11 +213,24 @@ void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
     router_req->dest_y = req->dest_y;
     router_req->initiator_addr = req->initiator_addr;
     router_req->set_size(req->get_size());
-    router_req->set_data(req->get_data());
+    // A read-data response flit carries its data slice BY VALUE across the
+    // mesh (like the RTL chimney's R flits): the incoming req's data points
+    // into our own request flit's payload, which is recycled per beat, so a
+    // queued response flit cannot alias it. Ack flits (is_address) carry none.
+    if (!req->get_is_write() && !is_address && req->get_size() > 0
+        && req->get_data() != NULL)
+    {
+        router_req->set_payload(req->get_data(), req->get_size());
+    }
+    else
+    {
+        router_req->set_data(req->get_data());
+    }
     router_req->set_addr(req->get_addr());
     router_req->set_is_write(req->get_is_write());
     router_req->set_opcode(req->get_opcode());
     router_req->set_second_data(req->get_second_data());
+    router_req->set_resp_status(req->get_resp_status());
 
     this->queue.push(router_req);
     this->ni.fsm_event.enqueue();
@@ -286,6 +307,8 @@ NetworkInterfaceV2::NetworkInterfaceV2(vp::ComponentConf &config)
     this->y = get_js_config()->get_int("y");
     this->narrow_width = get_js_config()->get_uint("narrow_width");
     this->wide_width = get_js_config()->get_uint("wide_width");
+    this->rsp_allocator[0] = vp::IoReqAllocator::get(this->narrow_width);
+    this->rsp_allocator[1] = vp::IoReqAllocator::get(this->wide_width);
     this->ni_outstanding_reqs = get_js_config()->get_int("ni_outstanding_reqs");
     this->max_burst_size = get_js_config()->get_uint("max_burst_size");
 
@@ -376,10 +399,12 @@ vp::IoRespAck NetworkInterfaceV2::wide_response(vp::Block *__this, vp::IoReq *re
 
 // Recover our own FloonocReqV2 from a downstream response. A beat target answers
 // with DISTINCT per-beat objects (initiator-owned convention) carrying our request
-// as req->initiator; we fold this beat's per-beat payload (addr/size/data/framing/
+// as req->initiator; we fold this beat's per-beat fields (addr/size/framing/
 // status) onto our own request — reused per beat, exactly as the legacy same-object
-// beat-stream model expects — and free the beat. A write ack round-trips our own
-// object (req == initiator), so there is nothing to fold or free.
+// beat-stream model expects — copy its allocator-provided payload into our flit
+// payload (the beat is recycled the moment we free it), and return the beat to
+// its pool. A write ack round-trips our own object (req == initiator), so there
+// is nothing to fold or free.
 FloonocReqV2 *NetworkInterfaceV2::unwrap_response(vp::IoReq *req)
 {
     FloonocReqV2 *self_req = (FloonocReqV2 *)req->initiator;
@@ -387,11 +412,14 @@ FloonocReqV2 *NetworkInterfaceV2::unwrap_response(vp::IoReq *req)
     {
         self_req->set_addr(req->get_addr());
         self_req->set_size(req->get_size());
-        self_req->set_data(req->get_data());
+        if (!req->get_is_write() && req->get_size() > 0)
+        {
+            self_req->set_payload(req->get_data(), req->get_size());
+        }
         self_req->is_first = req->is_first;
         self_req->is_last  = req->is_last;
         self_req->set_resp_status(req->get_resp_status());
-        delete req;
+        req->free();
     }
     return self_req;
 }
@@ -642,18 +670,41 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
         }
         else
         {
+            // Read response flit: forward it upstream as one distinct
+            // allocator-backed beat carrying the flit's payload (the burst
+            // request is data-less and never round-tripped as a read beat;
+            // the external master copies each beat out, frees it, and frees
+            // its own burst request on the last one — initiator-owned
+            // convention).
             _this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "Reducing remaining size of burst (burst: %p, size: %d, req: %p, size %d)\n",
                 burst, (int)burst->remaining_size, req, (int)req->get_size());
+
+            uint64_t total = burst->get_size();
+            uint64_t offset = total - burst->remaining_size;
             burst->remaining_size -= req->get_size();
+
+            vp::IoReq *beat = _this->rsp_allocator[wide]->alloc();
+            beat->prepare();
+            beat->set_addr(burst->get_addr() + offset);
+            beat->set_size(req->get_size());
+            beat->set_is_write(false);
+            if (req->get_size() > 0)
+            {
+                memcpy(beat->get_data(), req->get_data(), req->get_size());
+            }
+            beat->is_first = offset == 0;
+            beat->is_last = burst->remaining_size == 0;
+            beat->burst_id = burst->burst_id;
+            beat->initiator = burst->initiator;
+            beat->set_resp_status(req->get_resp_status());
 
             if (burst->remaining_size == 0)
             {
                 _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Finished burst (burst: %p)\n", burst);
                 _this->nb_pending_bursts[wide]--;
-                burst->set_resp_status(vp::IO_RESP_OK);
-                port->resp(burst);
             }
+            port->resp(beat);
         }
 
         _this->fsm_event.enqueue();

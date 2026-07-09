@@ -122,6 +122,11 @@ private:
     vp::IoSlave wide_input_itf;
     vp::IoSlave narrow_input_itf;
 
+    // Pools serving the read response beats delivered upstream to the external
+    // masters (payload co-allocated), indexed by the burst's wide flag:
+    // [0] = narrow_width, [1] = wide_width.
+    vp::IoReqAllocator *rsp_allocator[2];
+
     // Mesh links, indexed by NW_*: outputs inject into the routers, inputs
     // receive what the routers deliver.
     std::array<FloonocLinkMaster, NW_NB> link_out;

@@ -75,6 +75,10 @@ IDmaBeAxi::IDmaBeAxi(vp::Component *idma, std::string itf_name, IdmaBeProducer *
         this->burst_info[i] = info;
         this->burst_data[i] = new uint8_t[AXI_PAGE_SIZE];
     }
+
+    // Data-less request pool (payload size 0), serving the whole-burst read
+    // requests (beat protocol: read burst requests carry no data).
+    this->req_allocator = vp::IoReqAllocator::get(0);
 }
 
 
@@ -84,8 +88,11 @@ IDmaBeAxi::~IDmaBeAxi()
     for (BurstInfo *info : this->burst_info)
     {
         // Free a read request still held from an un-acked DENIED retry (nullptr
-        // once the bus accepted it and took ownership).
-        delete info->read_req;
+        // once freed on the burst's last response).
+        if (info->read_req != nullptr)
+        {
+            info->read_req->free();
+        }
         delete info;
     }
     for (uint8_t *buf : this->burst_data)
@@ -120,7 +127,7 @@ void IDmaBeAxi::reset(bool active)
             info->next_beat_idx = 0;
             if (info->read_req != nullptr)
             {
-                delete info->read_req;
+                info->read_req->free();
                 info->read_req = nullptr;
             }
             info->is_write = false;
@@ -276,14 +283,14 @@ bool IDmaBeAxi::issue_beat()
     }
     else
     {
-        // Reads: exactly one full-size req per burst, on a heap-allocated
-        // request the consuming side owns and frees (no pooled object handed
-        // out). Reuse the same object across a DENIED retry; clear the handle
-        // once the bus accepts it.
+        // Reads: exactly one full-size data-less req per burst (beat protocol:
+        // the read data comes back inside distinct allocator-backed response
+        // beats). We own it (initiator-owned convention) and free it on the
+        // last read response. Reuse the same object across a DENIED retry.
         int slot_idx = (int)info->burst_id;
         if (info->read_req == nullptr)
         {
-            info->read_req = new vp::IoReq();
+            info->read_req = this->req_allocator->alloc();
         }
         vp::IoReq *beat = info->read_req;
 
@@ -291,7 +298,7 @@ bool IDmaBeAxi::issue_beat()
         beat->set_is_write(false);
         beat->set_addr(info->base);
         beat->set_size(info->total_size);
-        beat->set_data(this->burst_data[slot_idx]);
+        beat->set_data(NULL);
         beat->is_first = true;
         beat->is_last  = true;
         beat->burst_id = info->burst_id;
@@ -368,39 +375,40 @@ vp::IoRespAck IDmaBeAxi::resp_meth(vp::Block *__this, vp::IoReq *req)
         return vp::IO_RESP_ACCEPTED;
     }
 
-    // Read beat. The downstream has already paced this at the modeled ready
-    // cycle. Forward straight to the destination BE if it can take the
-    // chunk now — this saves a 1-cycle fsm hop per beat and keeps the
-    // steady-state read pipeline at 1 beat/cycle. When the destination is
-    // back-pressured we fall back to queueing and let fsm_handler drain
-    // when it becomes ready.
+    // Read beat: a distinct allocator-backed object whose co-allocated payload
+    // carries the data (our read_req is data-less and never round-tripped).
+    // Copy the payload into the slot's staging buffer — the forwarded chunk
+    // pointer may sit in read_push_queue past this call, so it must not point
+    // into the beat — then free the beat back to its pool.
+    uint64_t offset = info->bytes_responded - beat_size;
+    uint8_t *chunk = self->burst_data[info->burst_id] + offset;
+    if (beat_size > 0)
+    {
+        std::memcpy(chunk, beat_data, beat_size);
+    }
+    req->free();
+
+    // The downstream has already paced this at the modeled ready cycle.
+    // Forward straight to the destination BE if it can take the chunk now —
+    // this saves a 1-cycle fsm hop per beat and keeps the steady-state read
+    // pipeline at 1 beat/cycle. When the destination is back-pressured we fall
+    // back to queueing and let fsm_handler drain when it becomes ready.
     if (self->be->is_ready_to_accept_data(info->transfer))
     {
         self->read_ack_queue.push({info, beat_size});
-        self->be->write_data(info->transfer, beat_data, beat_size);
+        self->be->write_data(info->transfer, chunk, beat_size);
     }
     else
     {
-        self->read_push_queue.push(std::make_tuple(info, beat_data, beat_size));
+        self->read_push_queue.push(std::make_tuple(info, chunk, beat_size));
         self->fsm_event.enqueue();
-    }
-
-    // Free the read response beat now that its bytes have been forwarded (the
-    // data lives in burst_data, not in the beat). A splitting producer (beat
-    // adapter) delivers DISTINCT beat objects we free here; a plain slave / NoC
-    // round-trips our own read_req as the single response, which we must NOT free
-    // here — it is freed once below as read_req. (The write path returns above;
-    // its acks ride the pooled beats[] slots and must not be freed.)
-    if (req != info->read_req)
-    {
-        delete req;
     }
 
     // Last read response received: we own read_req and free it here (nothing
     // downstream frees it). Null it so the recycled slot reallocates next time.
     if (info->bytes_responded == info->total_size)
     {
-        delete info->read_req;
+        info->read_req->free();
         info->read_req = nullptr;
     }
 
