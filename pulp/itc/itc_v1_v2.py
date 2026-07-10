@@ -4,6 +4,7 @@
 
 import gvsoc.gui
 import gvsoc.systree
+import gvsoc.signature
 
 
 class Itc_v1_V2(gvsoc.systree.Component):
@@ -28,7 +29,7 @@ class Itc_v1_V2(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, itf_name='irq_ack', signature='wire<int>')
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Sync())
 
     def i_EVENT(self, id: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, itf_name=f'in_event_{id}', signature='wire<bool>')

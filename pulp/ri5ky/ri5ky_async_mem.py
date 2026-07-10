@@ -6,6 +6,7 @@
 
 import gvsoc.systree
 from memory.memory_v3 import MemoryV3Config
+import gvsoc.signature
 
 
 class Ri5kyAsyncMem(gvsoc.systree.Component):
@@ -31,4 +32,4 @@ class Ri5kyAsyncMem(gvsoc.systree.Component):
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
         # Generic 'io_v2' signature (not IoV2Sync): the master must use its
         # async resp/retry path, which is what parks the core on p.elw.
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2SingleReq())

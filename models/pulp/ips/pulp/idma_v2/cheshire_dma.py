@@ -26,6 +26,7 @@ programming interface differs.
 """
 
 import gvsoc.systree
+from gvsoc.signature import IoV2Sync, IoV2Beat
 
 
 class CheshireDmaV2(gvsoc.systree.Component):
@@ -102,6 +103,8 @@ class CheshireDmaV2(gvsoc.systree.Component):
 
         super().__init__(parent, name)
 
+        self._axi_width = axi_width
+
         self.add_sources([
             'ips/pulp/idma_v2/cheshire_dma.cpp',
             'ips/pulp/idma_v2/fe/idma_fe_cheshire.cpp',
@@ -121,7 +124,7 @@ class CheshireDmaV2(gvsoc.systree.Component):
 
         Carries the offload instruction stream from the Cheshire core.
         """
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=IoV2Sync())
 
     def o_OFFLOAD_GRANT(self, itf: gvsoc.systree.SlaveItf):
         """Binds the offload-grant wire back to the Cheshire core.
@@ -141,5 +144,5 @@ class CheshireDmaV2(gvsoc.systree.Component):
         ``axi_read`` and ``axi_write`` to separate router inputs via
         :meth:`itf_bind` directly.
         """
-        self.itf_bind('axi_read', itf, signature='io_v2')
-        self.itf_bind('axi_write', itf, signature='io_v2')
+        self.itf_bind('axi_read', itf, signature=IoV2Beat(self._axi_width))
+        self.itf_bind('axi_write', itf, signature=IoV2Beat(self._axi_width))

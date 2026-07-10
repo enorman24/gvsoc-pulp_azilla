@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gvsoc.systree
+import gvsoc.signature
 
 
 class StdoutV2(gvsoc.systree.Component):
@@ -28,4 +29,4 @@ class StdoutV2(gvsoc.systree.Component):
         })
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Sync())

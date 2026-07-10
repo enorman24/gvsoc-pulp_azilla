@@ -43,7 +43,7 @@ More accurate model of ``tests/spatz/spatz-rtl`` than the v2 cluster:
 import math
 
 import gvsoc.systree
-from gvsoc.signature import IoV2Beat
+from gvsoc.signature import IoV2Beat, IoV2SingleReq
 from pulp.cpu.iss.spatz import Spatz
 from pulp.cpu.iss.spatz_config import SpatzConfig
 import memory.memory_v3 as memory_v3
@@ -139,10 +139,15 @@ class SpatzClusterTcdm(gvsoc.systree.Component):
         self.bind(self, 'wide_input_0', ico, 'wide_input_0')
 
     def i_INPUT(self, port: int) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, f'input_{port}', signature='io_v2')
+        # Boundary forward to the TCDM interco's single-req input (DENY/retry
+        # + inline DONE, single-beat responses).
+        return gvsoc.systree.SlaveItf(self, f'input_{port}',
+            signature=IoV2SingleReq())
 
     def i_WIDE_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'wide_input_0', signature='io_v2')
+        # Boundary forward to the TCDM interco's wide single-req input.
+        return gvsoc.systree.SlaveItf(self, 'wide_input_0',
+            signature=IoV2SingleReq())
 
 
 class SnitchCluster(gvsoc.systree.Component):
@@ -256,8 +261,10 @@ class SnitchCluster(gvsoc.systree.Component):
         # DMA offload from core 0
         cores[dma_core].o_OFFLOAD(idma.i_OFFLOAD())
         idma.o_OFFLOAD_GRANT(cores[dma_core].i_OFFLOAD_GRANT())
-        self.itf_bind_master(idma, 'axi_read', wide_axi.i_INPUT(1))
-        self.itf_bind_master(idma, 'axi_write', wide_axi.i_INPUT(2))
+        # Beat-fidelity DMA read/write channels onto the wide beat plane
+        # (same 64-byte beat width on both sides: direct bind, no adapter).
+        idma.itf_bind('axi_read', wide_axi.i_INPUT(1), signature=IoV2Beat(64))
+        idma.itf_bind('axi_write', wide_axi.i_INPUT(2), signature=IoV2Beat(64))
 
         # Per-core memory ports
         tcdm_port = 0
@@ -294,9 +301,6 @@ class SnitchCluster(gvsoc.systree.Component):
     def handle_executable(self, binary):
         for core in self.cores:
             core.handle_executable(binary)
-
-    def itf_bind_master(self, comp, itf_name, slave_itf):
-        comp.itf_bind(itf_name, slave_itf, signature='io_v2')
 
     def i_MEIP(self, core: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'meip_{core}', signature='wire<bool>')

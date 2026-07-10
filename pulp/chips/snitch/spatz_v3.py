@@ -29,6 +29,7 @@ is loaded through ``utils.loader.loader_v2``.
 import os
 
 import gvsoc.systree
+from gvsoc.signature import IoV2Any
 from vp.clock_domain import Clock_domain
 import memory.memory_v3 as memory_v3
 from memory.memory_v3 import MemoryV3Config
@@ -204,10 +205,10 @@ class Soc(gvsoc.systree.Component):
         self.set_parameter('binary', binary)
 
     def i_HBM(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'hbm', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Any())
 
     def o_HBM(self, itf: gvsoc.systree.SlaveItf):
-        self.itf_bind('hbm', itf, signature='io_v2')
+        self.itf_bind('hbm', itf, signature=IoV2Any())
 
 
 class Spatz(gvsoc.systree.Component):
@@ -220,7 +221,7 @@ class Spatz(gvsoc.systree.Component):
         soc.o_HBM(self.i_HBM())
 
     def i_HBM(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'hbm', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Any())
 
 
 class SpatzBoard(gvsoc.systree.Component):

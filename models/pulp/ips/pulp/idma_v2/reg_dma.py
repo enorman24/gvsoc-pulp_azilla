@@ -39,6 +39,7 @@ import gvsoc.systree
 from gvsoc.gui import Signal, DisplayPulse, DisplayLogicBox
 from gvsoc.signature import IoV2Beat
 from ips.pulp.idma_v2.reg_dma_config import RegDmaConfig
+from gvsoc.signature import IoV2Sync
 
 
 class RegDmaV2(gvsoc.systree.Component):
@@ -175,7 +176,7 @@ class RegDmaV2(gvsoc.systree.Component):
         CPU writes here program transfer descriptors; CPU reads
         return DMA status registers.
         """
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=IoV2Sync())
 
     def o_AXI(self, itf: gvsoc.systree.SlaveItf):
         """Convenience binding — wires both ``axi_read`` and ``axi_write``

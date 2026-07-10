@@ -23,6 +23,7 @@ responding once all cores reached the barrier.
 """
 
 import gvsoc.systree
+import gvsoc.signature
 import gvsoc.gui
 import regmap.regmap
 import regmap.regmap_hjson
@@ -52,10 +53,10 @@ class ClusterRegisters(gvsoc.systree.Component):
         self.itf_bind(f'external_irq_{core}', itf, signature='wire<bool>')
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2SingleReq())
 
     def i_CORE_INPUT(self, core) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, f'input_{core}', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, f'input_{core}', signature=gvsoc.signature.IoV2SingleReq())
 
     def gen_gui(self, parent_signal):
         return gvsoc.gui.Signal(self, parent_signal, name=self.name, is_group=True, groups=["regmap"])

@@ -26,6 +26,7 @@ programming interface differs.
 """
 
 import gvsoc.systree
+from gvsoc.signature import IoV2Beat
 
 
 class SnitchDmaV2(gvsoc.systree.Component):
@@ -115,6 +116,8 @@ class SnitchDmaV2(gvsoc.systree.Component):
 
         super().__init__(parent, name)
 
+        self._axi_width = axi_width
+
         self.add_sources([
             'ips/pulp/idma_v2/snitch_dma.cpp',
             'ips/pulp/idma_v2/fe/idma_fe_xdma.cpp',
@@ -156,5 +159,5 @@ class SnitchDmaV2(gvsoc.systree.Component):
         ``axi_read`` and ``axi_write`` to separate router inputs via
         :meth:`itf_bind` directly.
         """
-        self.itf_bind('axi_read', itf, signature='io_v2')
-        self.itf_bind('axi_write', itf, signature='io_v2')
+        self.itf_bind('axi_read', itf, signature=IoV2Beat(self._axi_width))
+        self.itf_bind('axi_write', itf, signature=IoV2Beat(self._axi_width))

@@ -30,6 +30,7 @@ from cpu.iss_v2.riscv import (Arch, ExecInOrder, IssModule, Lsu, LsuV2, Offload,
 from gvsoc.systree import Component
 from pulp.cpu.iss.spatz_config import SpatzConfig
 from pulp.snitch.snitch_isa import Xdma
+from gvsoc.signature import IoV2SingleReq
 
 
 class ArchSpatzMempool(Arch):
@@ -130,4 +131,4 @@ class SpatzMempool(RiscvCommon):
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'vlsu_{port}', itf,
-            signature='io_v2' if getattr(self, '_vlsu_v2', False) else 'io')
+            signature=IoV2SingleReq() if getattr(self, '_vlsu_v2', False) else 'io')

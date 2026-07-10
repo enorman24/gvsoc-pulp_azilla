@@ -31,6 +31,7 @@ from cpu.iss_v2.riscv import (Arch, ExecInOrder, Regfile, PrefetchSingleLine, Of
                               IrqExternal, Lsu, LsuV2)
 from pulp.cpu.iss.spatz_config import SpatzConfig
 from cpu.iss_v2.riscv import RiscvCommon, IssModule
+from gvsoc.signature import IoV2SingleReq
 
 
 isa_instances: dict[str,Isa] = {}
@@ -102,8 +103,10 @@ class Spatz(RiscvCommon):
         slave: gvsoc.systree.SlaveItf
             Slave interface
         """
+        # Single-req initiator: each VLSU lane access is one request answered
+        # by a single-beat response routed back by identity.
         self.itf_bind(f'vlsu_{port}', itf,
-            signature='io_v2' if getattr(self, '_vlsu_v2', False) else 'io')
+            signature=IoV2SingleReq() if getattr(self, '_vlsu_v2', False) else 'io')
 
     @override
     def gen_gui(self, parent_signal: Signal) -> Signal:

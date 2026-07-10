@@ -23,6 +23,7 @@ from cpu.iss_v2.riscv import (Arch, ExecInOrder, IssModule, Lsu, LsuV2, Offload,
 from cpu.iss_v2.riscv_config import RiscvConfig
 from gvsoc.systree import Component
 from pulp.snitch.snitch_isa import Xdma
+from gvsoc.signature import IoV2SingleReq
 
 
 class SnitchMempoolConfig(RiscvConfig):
@@ -117,4 +118,4 @@ class SnitchMempool(RiscvCommon):
 
     def o_VLSU(self, port: int, itf: gvsoc.systree.SlaveItf):
         self.itf_bind(f'vlsu_{port}', itf,
-            signature='io_v2' if getattr(self, '_lsu_v2', False) else 'io')
+            signature=IoV2SingleReq() if getattr(self, '_lsu_v2', False) else 'io')

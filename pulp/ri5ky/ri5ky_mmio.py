@@ -9,6 +9,7 @@
 #
 
 import gvsoc.systree
+import gvsoc.signature
 
 
 class Ri5kyMmio(gvsoc.systree.Component):
@@ -21,4 +22,4 @@ class Ri5kyMmio(gvsoc.systree.Component):
         self.add_sources(['pulp/ri5ky/ri5ky_mmio.cpp'])
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Sync())

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2Sync
+from gvsoc.signature import IoV2Sync, IoV2SingleReq
 
 
 class SpatzTcdmIntercoConfig(Config):
@@ -316,21 +316,20 @@ class SpatzTcdmInterco(Component):
         ``mem_wide_narrow_mux``. Same async DENY/retry contract as the
         narrow inputs. Atomics are not supported on this path.
         """
-        return SlaveItf(self, f'wide_input_{id}', signature='io_v2')
+        return SlaveItf(self, f'wide_input_{id}', signature=IoV2SingleReq())
 
     def i_INPUT(self, id: int) -> SlaveItf:
         """Returns the slave port ``input_<id>`` for master ``id``.
 
         Each master gets its own muxed input port. The input side speaks
-        the general (async-capable) ``io_v2`` contract: every fresh
+        the single-req contract (:class:`IoV2SingleReq`): every fresh
         request is ``DENIED`` and the master is later ``retry()``-ed
         by the round-robin arbiter; the re-issued request then
         completes inline as ``DONE``. A master bound here must
-        therefore implement the standard async DENY/retry handshake
-        (i.e. be ``IoV2BigPacket`` / generic ``io_v2``, not
-        ``IoV2Sync``).
+        therefore implement the standard DENY/retry handshake
+        (so not ``IoV2Sync``).
         """
-        return SlaveItf(self, f'input_{id}', signature='io_v2')
+        return SlaveItf(self, f'input_{id}', signature=IoV2SingleReq())
 
     def o_OUTPUT(self, id: int, itf: SlaveItf):
         """Binds downstream bank ``output_<id>`` to ``itf``.
