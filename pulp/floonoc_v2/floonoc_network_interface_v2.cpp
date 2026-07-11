@@ -35,6 +35,9 @@ void NetworkQueueV2::reset(bool active)
     {
         while (this->queue.size() > 0)
         {
+            // Queued flits are exclusively ours — recycle them. The external
+            // bursts/beats they reference are dropped, as before.
+            this->ni.flit_allocator->free(this->queue.front());
             this->queue.pop();
         }
         this->stalled = false;
@@ -104,9 +107,8 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         // (each beat forwards as a partial response chunk; the FloonocReqV2
         // is only released on the last beat).
         uint64_t size = is_address ? burst_size : std::min(this->width, burst_size);
-        FloonocReqV2 *router_req = new FloonocReqV2();
+        FloonocReqV2 *router_req = this->ni.flit_allocator->alloc();
 
-        router_req->prepare();
         router_req->src_x = this->ni.x;
         router_req->src_y = this->ni.y;
         router_req->is_rsp = false;
@@ -125,6 +127,12 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         router_req->set_is_write(req->get_is_write());
         router_req->set_opcode(req->get_opcode());
         router_req->set_second_data(req->get_second_data());
+        // Snapshot the external burst metadata the source-side B accounting
+        // needs into the flit's own (otherwise unused) fields: a write beat is
+        // consumed and freed by the destination target, so the B flit — which
+        // copies these — is all that comes back to account the ack from.
+        router_req->burst_id = req->burst_id;
+        router_req->initiator = req->initiator;
 
         if (wide)
         {
@@ -159,6 +167,16 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         router_req->dest_x = entry->x;
         router_req->dest_y = entry->y;
 
+        // Beat encapsulation: a W flit that covers its WHOLE beat carries
+        // beat ownership — the destination hands the beat itself to the
+        // target (no wrapper) and the beat is consumed and freed there. A
+        // split beat (a slice smaller than the beat: oversized input beats
+        // behind transparent IoV2Any forwarders, or the entry clamp above)
+        // keeps the legacy scheme — its buffer must outlive every flit, so
+        // the beat stays unfreed until its B flit returns to the source.
+        router_req->owns_beat = !is_address && req->get_opcode() == vp::WRITE
+            && size == req->get_size();
+
         // Wormhole packet framing by DESTINATION run: a packet may only span
         // flits going to the same mesh position, because it reserves a router
         // output along one route until its tail flit. A burst that crosses a
@@ -192,12 +210,11 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
 void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
 {
     // Allocate a fresh FloonocReqV2 for the response traversal, copying the
-    // metadata the router needs from the incoming request. The caller deletes
+    // metadata the router needs from the incoming request. The caller frees
     // the original after we return — mirrors the v1 enqueue_router_req
     // response-path branch.
-    FloonocReqV2 *router_req = new FloonocReqV2();
+    FloonocReqV2 *router_req = this->ni.flit_allocator->alloc();
 
-    router_req->prepare();
     // Response flits are single-flit packets, mirroring the RTL chimney: R
     // beats set hdr.last=1 on every beat ("no reason to do wormhole routing for
     // R bursts" — floo_axi_chimney) and the B ack is a lone flit. Read data
@@ -214,6 +231,14 @@ void NetworkQueueV2::enqueue_router_rsp(FloonocReqV2 *req, bool is_address)
     router_req->dest_x = req->dest_x;
     router_req->dest_y = req->dest_y;
     router_req->initiator_addr = req->initiator_addr;
+    // Carry the external write-burst metadata through to the source side:
+    // only the write-B path of an owns_beat flit consumes these there (the
+    // beat it belongs to was consumed and freed by the destination target).
+    // Stale for R flits, whose source-side accounting uses the still-alive
+    // read burst instead.
+    router_req->burst_id = req->burst_id;
+    router_req->initiator = req->initiator;
+    router_req->owns_beat = req->owns_beat;
     router_req->set_size(req->get_size());
     // A read-data response flit carries its data slice BY VALUE across the
     // mesh (like the RTL chimney's R flits): the incoming req's data points
@@ -242,19 +267,21 @@ void NetworkQueueV2::send_router_req()
 {
     FloonocReqV2 *req = this->queue.front();
     this->queue.pop();
-    vp::IoReq *burst = req->burst;
 
+    // Keyed on the flit's own copies of is_write/wide: req->burst may only be
+    // dereferenced on the request path (a write beat is consumed and freed by
+    // the destination target, so it is stale on the B response path).
     if (!req->is_rsp)
     {
         int *nb_req;
         if (req->wide)
         {
-            nb_req = burst->get_is_write() ? &this->ni.wide_write_pending_burst_nb_req :
+            nb_req = req->get_is_write() ? &this->ni.wide_write_pending_burst_nb_req :
                 &this->ni.wide_read_pending_burst_nb_req;
         }
         else
         {
-            nb_req = burst->get_is_write() ? &this->ni.narrow_write_pending_burst_nb_req :
+            nb_req = req->get_is_write() ? &this->ni.narrow_write_pending_burst_nb_req :
                 &this->ni.narrow_read_pending_burst_nb_req;
         }
         *nb_req = *nb_req - 1;
@@ -264,8 +291,8 @@ void NetworkQueueV2::send_router_req()
         }
     }
 
-    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Handling addr burst (burst: %p, offset: 0x%x, size: 0x%x, is_write: %d, op: %d)\n",
-                    burst, burst->get_addr(), burst->get_size(), burst->get_is_write(), burst->get_opcode());
+    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Injecting flit (req: %p, base: 0x%x, size: 0x%x, is_write: %d, op: %d, is_rsp: %d)\n",
+                    req, req->get_addr(), req->get_size(), req->get_is_write(), req->get_opcode(), req->is_rsp);
 
     this->stalled = this->ni.link_out[this->nw].req(req);
     if (this->stalled)
@@ -313,6 +340,7 @@ NetworkInterfaceV2::NetworkInterfaceV2(vp::ComponentConf &config)
     this->rsp_allocator[1] = vp::IoReqAllocator::get(this->wide_width);
     this->ack_allocator = vp::IoReqAllocator::get(0);
     this->fwd_wr_allocator = vp::IoReqAllocator::get(0);
+    this->flit_allocator = FloonocReqV2Allocator::get();
     this->ni_outstanding_reqs = get_js_config()->get_int("ni_outstanding_reqs");
     this->max_burst_size = get_js_config()->get_uint("max_burst_size");
 
@@ -410,12 +438,13 @@ vp::IoRespAck NetworkInterfaceV2::wide_response(vp::Block *__this, vp::IoReq *re
 // expects — copy its allocator-provided payload into our flit payload (the
 // beat is recycled the moment we free it), and return the beat to its pool.
 //
-// Write path: the target consumed and freed the single-beat write beat we
-// forwarded (make_target_req) and answers with the distinct data-less burst
-// ack, carrying the flit as req->initiator (copied from the beat). Only the
-// status is folded — the flit's own addr/size drive the remaining_size
-// accounting, and its framing was forced to a self-contained single beat at
-// forward time — and the ack is freed (the initiator frees the ack).
+// Write path: the target consumed and freed the write object we forwarded
+// (make_target_req — the encapsulated external beat, or a split-path pool
+// wrapper) and answers with the distinct data-less burst ack, carrying the
+// flit as req->initiator (copied from the beat). Only the status is folded —
+// the flit's own addr/size drive the B accounting, and its framing was
+// forced to a self-contained single beat at forward time — and the ack is
+// freed (the initiator frees the ack).
 //
 // An atomic round-trips our own object (req == initiator), so there is
 // nothing to fold or free.
@@ -520,20 +549,29 @@ void NetworkInterfaceV2::reset(bool active)
         this->nb_pending_bursts[1] = 0;
         this->owes_retry_wide_input = false;
         this->owes_retry_narrow_input = false;
-        // A held (denied) forwarded write beat is ours and pool-backed —
-        // recycle it. A held read/atomic flit follows the existing reset
-        // discipline for in-flight flits (dropped without delete, like the
-        // flits still queued in the NetworkQueues). The incoming write beats
-        // tracked by wr_bursts are only reachable through those dropped
-        // flits, so they are dropped with them — consistent with reads,
-        // where the external master likewise never gets its in-flight burst
-        // answered across a reset.
+        // A held (denied) forwarded write object is allocator-backed either
+        // way — the encapsulated external beat (ours since GRANT under the
+        // consumer-frees contract) or a split-path pool wrapper — so return
+        // it to its pool. A held read/atomic flit is ours too — recycle it.
+        // The other in-flight flits (in router queues or pending responses)
+        // are dropped without freeing, and the write beats they encapsulate
+        // or reference with them — consistent with reads, where the external
+        // master likewise never gets its in-flight burst answered across a
+        // reset.
         for (vp::IoReq *held : {this->wide_target_stalled_req,
                                 this->narrow_target_stalled_req})
         {
-            if (held != NULL && held->initiator != held)
+            if (held == NULL)
+            {
+                continue;
+            }
+            if (held->initiator != held)
             {
                 held->free();
+            }
+            else
+            {
+                this->flit_allocator->free((FloonocReqV2 *)held);
             }
         }
         this->wide_target_stalled_req = NULL;
@@ -644,10 +682,12 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
         // machinery below still treats every accepted beat as its own
         // mini-burst (its own AW+W flits and its own B flit back, so the
         // router traffic — and the calibration — is unchanged), but the
-        // endpoint acknowledges once per BURST: each beat is consumed (freed
-        // when its B flit returns) and a single data-less pool ack answers
-        // the whole burst. Atomics keep the classic round-trip (keyed on
-        // opcode == WRITE, not get_is_write()).
+        // endpoint acknowledges once per BURST: a beat that fits one W flit
+        // travels the mesh encapsulated in it and is consumed and freed by
+        // the destination target (a split beat stays alive until its B flit
+        // returns, as before), and a single data-less pool ack answers the
+        // whole burst once every B flit is back. Atomics keep the classic
+        // round-trip (keyed on opcode == WRITE, not get_is_write()).
         if (req->get_opcode() == vp::WRITE)
         {
             this->traces.assert(req->allocator != nullptr,
@@ -704,13 +744,27 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
 // itself — its mesh framing has been consumed by the time it reaches us, and
 // handle_response relies on is_last to release it.
 //
-// Write data flits are wrapped in a DISTINCT data-less pool beat: under the
-// write-ack contract the target consumes and FREES granted write beats, and
-// the flit is a plain heap object (a target free() would corrupt it). The
-// beat aliases the flit's data — which itself points into the source-side
-// incoming beat's buffer, alive until its B flit returns — and back-references
-// the flit through initiator, so the burst ack (or the beat itself on
-// DONE/DENIED) leads back to the flit.
+// Write data flits come in two flavours, decided at enqueue time (owns_beat):
+//
+// A W flit covering its WHOLE beat hands the ENCAPSULATED EXTERNAL BEAT
+// itself to the target: the beat travelled the mesh inside the flit
+// (ownership moved to the flit at GRANT on the source side), and the target
+// consumes and frees it under the write-ack contract — no wrapper object.
+// The beat is rewritten as a self-contained single-beat submission at the
+// mesh-translated address (legal: we own it). This is the common case: on an
+// IoV2Beat-signature'd binding an incoming beat is capped at the port width,
+// which is also the carrier queue's slice width.
+//
+// A flit of a SPLIT beat (oversized beats behind transparent IoV2Any
+// forwarders, or an entry-clamped slice) is wrapped in a DISTINCT data-less
+// pool beat instead: the external beat's buffer must stay valid for the
+// beat's other flits, so the beat itself must not be handed out (the target
+// would free it); it stays unfreed until its B flit returns to the source.
+//
+// Either way the submitted object back-references the flit through
+// initiator, so the burst ack (or the object itself on DONE/DENIED) leads
+// back to the flit. The flit's own burst_id/initiator keep carrying the
+// external burst metadata for the B return and must not be touched here.
 //
 // Reads and atomics round-trip, so the flit itself is forwarded.
 vp::IoReq *NetworkInterfaceV2::make_target_req(FloonocReqV2 *req)
@@ -721,6 +775,21 @@ vp::IoReq *NetworkInterfaceV2::make_target_req(FloonocReqV2 *req)
 
     if (req->get_opcode() == vp::WRITE)
     {
+        if (req->owns_beat)
+        {
+            vp::IoReq *beat = req->burst;
+            this->traces.assert(beat != NULL && req->get_size() == beat->get_size()
+                && req->get_data() == beat->get_data(),
+                "owns_beat W flit does not cover its whole beat (flit: %p, beat: %p)",
+                req, beat);
+            beat->set_addr(req->get_addr());
+            beat->is_first = true;
+            beat->is_last = true;
+            beat->burst_id = -1;
+            beat->initiator = req;
+            return beat;
+        }
+
         vp::IoReq *beat = this->fwd_wr_allocator->alloc();
         beat->prepare();
         beat->set_addr(req->get_addr());
@@ -765,9 +834,10 @@ bool NetworkInterfaceV2::send_to_target(vp::IoReq *to_send, bool wide)
         int64_t latency;
         if (flit != to_send)
         {
-            // Forwarded write beat completed inline (last-beat DONE is the
+            // Forwarded write object completed inline (last-beat DONE is the
             // burst ack; ownership stayed with us): fold the status and the
-            // full timing annotation onto the flit and recycle the beat.
+            // full timing annotation onto the flit and return the object —
+            // encapsulated external beat or split-path wrapper — to its pool.
             flit->set_resp_status(to_send->get_resp_status());
             latency = to_send->get_full_latency();
             to_send->free();
@@ -787,8 +857,9 @@ bool NetworkInterfaceV2::send_to_target(vp::IoReq *to_send, bool wide)
         }
     }
     // GRANTED: the response arrives via wide_response / narrow_response. For
-    // a write beat, ownership (buffer included) moved to the target, which
-    // frees it; the burst ack comes back as a distinct data-less resp().
+    // a write beat, ownership (buffer included) moved on to the target, which
+    // consumes and frees the external beat; the burst ack comes back as a
+    // distinct data-less resp() leading back to the flit.
 
     return false;
 }
@@ -804,20 +875,23 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
         // the master when the burst is complete.
         _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received response from router (req: %p)\n", req);
 
-        vp::IoReq *burst = req->burst;
         bool wide = req->wide;
 
         // The inner FloonocReqV2's `wide` flag tells us which external slave
         // port the burst entered through; we use that to dispatch the
         // response rather than burst->initiator (which belongs to the
-        // master, e.g. the iDMA's BurstInfo*).
+        // master, e.g. the iDMA's BurstInfo*). Branches are keyed on the
+        // flit's own is_write/opcode copies: for the B flit of an owns_beat
+        // write the beat behind req->burst was consumed and freed by the
+        // destination target, so it must not be dereferenced.
         vp::IoSlave *port = wide ? &_this->wide_input_itf : &_this->narrow_input_itf;
 
-        if (burst->get_is_write() && burst->get_opcode() != vp::WRITE)
+        if (req->get_is_write() && req->get_opcode() != vp::WRITE)
         {
             // Atomics keep the classic round-trip: hand the master its own
             // object back with the completion status (the response data was
             // written in place, the W flit pointed into its buffer).
+            vp::IoReq *burst = req->burst;
             _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received atomic response (burst: %p)\n",
                 burst);
             _this->nb_pending_bursts[wide]--;
@@ -825,35 +899,54 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             burst->set_resp_status(req->get_resp_status());
             port->resp(burst);
         }
-        else if (burst->get_is_write())
+        else if (req->get_is_write())
         {
             // Per-burst write acknowledgement: this B flit completes ONE
             // incoming write beat (the mesh treated it as its own mini-burst).
-            // The beat has been ours since GRANTED; its buffer backed the W
-            // flits' data and its remaining_size fed the destination-side
-            // accounting until this very point, so this is the earliest it
-            // may be freed — exactly where the per-beat resp() used to fire,
-            // which also keeps the burst ack on the same cycle as the old
-            // last per-beat resp().
-            _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received write beat response (beat: %p)\n",
-                burst);
+            // The B still fires where the old per-beat resp() used to, so
+            // the ack timing is unchanged.
+            _this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                "Received write beat response (flit: %p, burst_id: %ld)\n",
+                req, (long)req->burst_id);
             _this->nb_pending_bursts[wide]--;
 
             bool error = req->get_resp_status() == vp::IO_RESP_INVALID;
-            uint64_t beat_size = burst->get_size();
 
-            if (burst->is_first && burst->is_last && burst->burst_id == -1)
+            // Resolve the ack accounting fields. owns_beat: the beat was
+            // consumed and freed at the destination — everything came back
+            // in the flit (size, external burst_id/initiator snapshotted at
+            // enqueue, pre-translation address in initiator_addr). Split
+            // beat: the beat is still ours and alive (its buffer backed all
+            // the W flits until now), and this single B — sent once every
+            // slice's wrapper was consumed — is exactly where it is freed,
+            // like the pre-encapsulation model did. burst_id == -1 is a
+            // reliable lone-beat marker either way: admission asserts that
+            // any multi-beat write carries burst_id >= 0.
+            uint64_t beat_size;
+            int64_t burst_id;
+            void *initiator;
+            uint64_t base;
+            if (req->owns_beat)
+            {
+                beat_size = req->get_size();
+                burst_id = req->burst_id;
+                initiator = req->initiator;
+                base = req->initiator_addr;
+            }
+            else
+            {
+                vp::IoReq *burst = req->burst;
+                beat_size = burst->get_size();
+                burst_id = burst->burst_id;
+                initiator = burst->initiator;
+                base = burst->get_addr();
+                burst->free();
+            }
+
+            if (burst_id == -1)
             {
                 // Lone single-beat burst without an id: bypasses the tracking
-                // map and completes on its own B. Snapshot the ack fields,
-                // free the beat, and answer with a distinct pool ack (the
-                // beat is payload-backed, so it cannot be recycled as the
-                // data-less ack — clearing its data pointer would corrupt
-                // its pool).
-                void *initiator = burst->initiator;
-                uint64_t base = burst->get_addr();
-                burst->free();
-
+                // map and completes on its own B.
                 vp::IoReq *ack = _this->ack_allocator->alloc();
                 ack->prepare();
                 ack->set_addr(base);
@@ -869,14 +962,13 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             }
             else
             {
-                auto it = _this->wr_bursts[wide].find(burst->burst_id);
+                auto it = _this->wr_bursts[wide].find(burst_id);
                 _this->traces.assert(it != _this->wr_bursts[wide].end(),
                     "write beat response for untracked burst (burst_id: %ld)",
-                    (long)burst->burst_id);
+                    (long)burst_id);
                 WrTrack &track = it->second;
                 track.acked_bytes += beat_size;
                 track.error |= error;
-                burst->free();
 
                 // Order-robust close: B flits may return out of order, so the
                 // burst completes when the is_last beat has been submitted AND
@@ -906,7 +998,9 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
             // request is data-less and never round-tripped as a read beat;
             // the external master copies each beat out, frees it, and frees
             // its own burst request on the last one — initiator-owned
-            // convention).
+            // convention). The read burst stays master-owned and alive, so
+            // dereferencing it here is fine.
+            vp::IoReq *burst = req->burst;
             _this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "Reducing remaining size of burst (burst: %p, size: %d, req: %p, size %d)\n",
                 burst, (int)burst->remaining_size, req, (int)req->get_size());
@@ -940,7 +1034,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
 
         _this->fsm_event.enqueue();
 
-        delete req;
+        _this->flit_allocator->free(req);
     }
     else
     {
@@ -984,7 +1078,7 @@ bool NetworkInterfaceV2::link_req(vp::Block *__this, FloonocReqV2 *req, int nw)
         else
         {
             // Address-only phase of a split write — no actual transfer to do.
-            delete req;
+            _this->flit_allocator->free(req);
         }
     }
 
@@ -1087,10 +1181,42 @@ void NetworkInterfaceV2::handle_response(FloonocReqV2 *req)
             this->rsp_queue.handle_rsp(req, false);
         }
     }
+    else if (req->get_opcode() != vp::WRITE)
+    {
+        // Atomic response: atomics keep the classic round-trip on the
+        // master's own (still-alive) object — account the data phase and
+        // emit the single ack through the mesh once complete.
+        vp::IoReq *burst = req->burst;
+
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "Reducing remaining size of burst (burst: %p, size: %d, req: %p, size %d)\n",
+            burst, (int)burst->remaining_size, req, (int)req->get_size());
+        burst->remaining_size -= req->get_size();
+
+        if (burst->remaining_size == 0)
+        {
+            this->trace.msg(vp::Trace::LEVEL_DEBUG, "Finished burst (burst: %p)\n", burst);
+            req->dest_x = req->src_x;
+            req->dest_y = req->src_y;
+            this->rsp_queue.handle_rsp(req, true);
+        }
+    }
+    else if (req->owns_beat)
+    {
+        // Write ack for an encapsulated beat: the beat was consumed and
+        // freed by the target, so nothing may be dereferenced through
+        // req->burst. The flit covered the whole beat, so this ack completes
+        // the mini-burst — send the B flit back to the source NI immediately.
+        req->dest_x = req->src_x;
+        req->dest_y = req->src_y;
+        this->rsp_queue.handle_rsp(req, true);
+    }
     else
     {
-        // Write response: only emit one ack through the mesh, after all
-        // data-phase requests have arrived.
+        // Write ack for one wrapped flit of a SPLIT beat: the beat is alive
+        // (its buffer backs the beat's other flits; the source frees it on
+        // the B) — account this slice on it and emit the single B flit once
+        // every slice's wrapper has been consumed.
         vp::IoReq *burst = req->burst;
 
         this->trace.msg(vp::Trace::LEVEL_TRACE,
@@ -1112,7 +1238,7 @@ void NetworkInterfaceV2::handle_response(FloonocReqV2 *req)
     // immediately as before.
     if (req->is_last)
     {
-        delete req;
+        this->flit_allocator->free(req);
     }
 }
 

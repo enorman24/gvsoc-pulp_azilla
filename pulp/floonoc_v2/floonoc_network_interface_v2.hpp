@@ -101,9 +101,9 @@ private:
     static vp::IoReqStatus wide_req(vp::Block *__this, vp::IoReq *req);
     vp::IoReqStatus handle_req(vp::IoReq *req, bool wide);
     // Destination side: build the object forwarded to the local target for one
-    // mesh request flit. Write data flits are wrapped in a distinct data-less
-    // pool beat (the write-ack contract makes the target consume and FREE
-    // granted write beats; the flit is a plain heap object); reads and atomics
+    // mesh request flit. Write data flits hand the encapsulated external write
+    // beat itself to the target (ownership travelled with the flit; the target
+    // consumes and frees it under the write-ack contract); reads and atomics
     // forward the flit itself.
     vp::IoReq *make_target_req(FloonocReqV2 *req);
     // Destination side: send (or re-send, from a retry) a request built by
@@ -142,18 +142,24 @@ private:
     // Size-0 (data-less) pools for the per-burst write-ack contract:
     // - ack_allocator serves the single write burst ack sent upstream to the
     //   external master once every beat of a burst has its B flit back.
-    // - fwd_wr_allocator serves the self-contained single-beat write beats
-    //   forwarded to the local target on the destination side (the target
-    //   frees granted write beats, so they must be pool objects — the
-    //   FloonocReqV2 flit is heap-managed and cannot be handed out).
+    // - fwd_wr_allocator serves the destination-side wrapper beats of the
+    //   SPLIT write path only (a beat spread over several W flits keeps its
+    //   buffer alive at the source, so each flit is forwarded wrapped in a
+    //   distinct consumable pool beat). A 1:1 beat (owns_beat) needs no
+    //   wrapper: the encapsulated external beat itself is handed out.
     vp::IoReqAllocator *ack_allocator;
     vp::IoReqAllocator *fwd_wr_allocator;
 
+    // Shared pool of FloonocReqV2 mesh flits (see FloonocReqV2Allocator),
+    // replacing bare new/delete on the flit lifecycle.
+    FloonocReqV2Allocator *flit_allocator;
+
     // Initiator side, per-burst write tracking (io_v2 write-acknowledgement):
-    // incoming write beats are consumed (freed once their B flit returns) and
-    // the burst is acknowledged upstream exactly once, keyed by burst_id per
-    // input port ([0] = narrow, [1] = wide). A lone is_first && is_last beat
-    // with burst_id == -1 bypasses the map (it completes on its own B).
+    // incoming write beats travel the mesh inside their W flit and are
+    // consumed and freed by the destination target; the B flits carry the
+    // accounting back and the burst is acknowledged upstream exactly once,
+    // keyed by burst_id per input port ([0] = narrow, [1] = wide). A lone
+    // beat with burst_id == -1 bypasses the map (it completes on its own B).
     struct WrTrack
     {
         uint64_t issued_bytes = 0;
@@ -198,8 +204,8 @@ private:
     // When a downstream target returns DENIED, v2 requires the master (this
     // NI) to hold the req and re-send it on the target's retry(). One slot
     // per output port. Holds whatever make_target_req built: the flit itself
-    // for reads/atomics, or our pool write beat for write data flits (the
-    // flit then stays reachable via beat->initiator).
+    // for reads/atomics, or the encapsulated external write beat for write
+    // data flits (the flit then stays reachable via beat->initiator).
     // nullptr-initialized here (not just in reset()) because reset() itself
     // inspects them to recycle a held pool write beat.
     vp::IoReq *wide_target_stalled_req = nullptr;

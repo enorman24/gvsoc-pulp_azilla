@@ -50,11 +50,24 @@ public:
     // source NI), false on the request path (towards the target).
     bool is_rsp;
     // Pointer back to the external IoReq (from the master) that this internal
-    // request belongs to. For writes this is one incoming write beat, owned by
-    // the source NI from GRANT until its B flit returns (write-ack contract):
-    // it stays unfreed — keeping its buffer and remaining_size usable by the
-    // flits that reference it — exactly that long.
+    // request belongs to. For a write beat that fits in one W flit (the
+    // common, IoV2Beat-signature'd case) the beat is ENCAPSULATED
+    // (owns_beat): ownership travels with the flit, and the destination NI
+    // hands the beat itself to the local target, which consumes and frees it
+    // (write-ack contract) — on the B return path the pointer is then STALE
+    // and must not be dereferenced (the ack accounting rides in the flit's
+    // own fields: burst_id, initiator, initiator_addr, size). A beat SPLIT
+    // across several W flits (oversized beats do reach the NI: transparent
+    // IoV2Any forwarders like the limiter bypass bind-time width matching,
+    // and the entry clamp can split when max_burst_size is 0) keeps the
+    // legacy scheme instead: the beat stays alive — nobody frees it before
+    // its B — its buffer backs all the W flits, and the source NI frees it
+    // when its single B flit returns.
     vp::IoReq *burst;
+    // True on a W flit that covers its whole beat: the flit carries beat
+    // ownership (see `burst` above). Decided at enqueue time on the source
+    // side, copied onto the B flit for the return-path accounting.
+    bool owns_beat;
     // True if the request travels on the wide network, false for narrow.
     bool wide;
     // True if this is the AR/AW (address) phase of a split request, false if it
@@ -67,10 +80,10 @@ public:
     // pooled objects recycled as soon as they are consumed, so a response
     // flit must carry its data slice across the mesh by value — like the RTL
     // chimney's R flits. Write flits keep pointing into the incoming write
-    // beat's buffer and leave this empty: the source NI owns the beat
-    // (write-ack contract — granted write beats are consumer-freed) and
-    // holding it unfreed keeps the buffer valid until the beat's B flit
-    // returns, which is exactly when the NI frees it.
+    // beat's buffer and leave this empty: the beat travels inside its W flit
+    // (ownership moved to the flit at GRANT) and stays unfreed until the
+    // destination target consumes it, which keeps the buffer valid exactly
+    // as long as the flit references it.
     std::vector<uint8_t> payload;
 
     // Point this flit's data at its own payload, filled from `data`.
@@ -79,6 +92,88 @@ public:
         this->payload.assign(data, data + size);
         this->set_data(this->payload.data());
     }
+};
+
+
+/**
+ * Pooled allocator for FloonocReqV2 mesh flits, mirroring vp::IoReqAllocator
+ * (intrusive freelist through IoReq::next, single-threaded by design). Flits
+ * are allocated by the source-side NI queues and released by whichever NI
+ * terminates them (destination NI for request flits, source NI for response
+ * flits), so the pool is shared across all NIs.
+ *
+ * Unlike vp::IoReqAllocator, alloc() DOES reinitialize the recycled flit:
+ * flits carry per-traversal mesh metadata (framing, is_rsp, burst, wide) and
+ * a stale value on any of them is a routing or lifetime bug, so everything is
+ * reset to the default-constructed values. The payload vector keeps its
+ * capacity across recycles, which is the point: at steady state a
+ * read-response flit's by-value data copy costs no allocation.
+ *
+ * Flits deliberately keep vp::IoReq::allocator == nullptr: they never cross
+ * an io_v2 consumer-frees boundary themselves (the write path hands the
+ * encapsulated external beat to the target, not the flit), so a misdirected
+ * req->free() fails loudly instead of corrupting an engine pool.
+ */
+class FloonocReqV2Allocator
+{
+public:
+    // Shared pool, created on first use. NIs fetch it once at construction.
+    static FloonocReqV2Allocator *get()
+    {
+        static FloonocReqV2Allocator allocator;
+        return &allocator;
+    }
+
+    FloonocReqV2 *alloc()
+    {
+        FloonocReqV2 *req = this->first_free;
+        if (req != NULL)
+        {
+            this->first_free = (FloonocReqV2 *)req->next;
+        }
+        else
+        {
+            req = new FloonocReqV2();
+        }
+        req->prepare();
+        req->is_first = true;
+        req->is_last = true;
+        req->burst_id = -1;
+        req->initiator = NULL;
+        req->set_data(NULL);
+        req->set_second_data(NULL);
+        req->burst = NULL;
+        req->owns_beat = false;
+        req->is_rsp = false;
+        req->is_address = false;
+        req->wide = false;
+        req->initiator_addr = 0;
+        req->dest_x = req->dest_y = req->src_x = req->src_y = 0;
+        return req;
+    }
+
+    void free(FloonocReqV2 *req)
+    {
+        req->next = this->first_free;
+        this->first_free = req;
+    }
+
+    // Releases the recycled flits at process teardown so they don't show up
+    // as leaks.
+    ~FloonocReqV2Allocator()
+    {
+        while (this->first_free != NULL)
+        {
+            FloonocReqV2 *req = this->first_free;
+            this->first_free = (FloonocReqV2 *)req->next;
+            delete req;
+        }
+    }
+
+private:
+    FloonocReqV2Allocator() {}
+
+    FloonocReqV2 *first_free = nullptr;
 };
 
 
