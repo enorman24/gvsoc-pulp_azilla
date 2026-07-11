@@ -50,7 +50,10 @@ public:
     // source NI), false on the request path (towards the target).
     bool is_rsp;
     // Pointer back to the external IoReq (from the master) that this internal
-    // request belongs to. Only dereferenced by the source NI.
+    // request belongs to. For writes this is one incoming write beat, owned by
+    // the source NI from GRANT until its B flit returns (write-ack contract):
+    // it stays unfreed — keeping its buffer and remaining_size usable by the
+    // flits that reference it — exactly that long.
     vp::IoReq *burst;
     // True if the request travels on the wide network, false for narrow.
     bool wide;
@@ -63,8 +66,11 @@ public:
     // data-less (io_v2 beat protocol) and the target's response beats are
     // pooled objects recycled as soon as they are consumed, so a response
     // flit must carry its data slice across the mesh by value — like the RTL
-    // chimney's R flits. Write flits keep pointing into the master's buffer
-    // (valid until the B ack round-trips) and leave this empty.
+    // chimney's R flits. Write flits keep pointing into the incoming write
+    // beat's buffer and leave this empty: the source NI owns the beat
+    // (write-ack contract — granted write beats are consumer-freed) and
+    // holding it unfreed keeps the buffer valid until the beat's B flit
+    // returns, which is exactly when the NI frees it.
     std::vector<uint8_t> payload;
 
     // Point this flit's data at its own payload, filled from `data`.

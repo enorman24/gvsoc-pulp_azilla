@@ -19,6 +19,7 @@
 
 #include <vp/vp.hpp>
 #include <list>
+#include <map>
 #include "floonoc_v2.hpp"
 #include "floonoc_link_v2.hpp"
 
@@ -99,6 +100,17 @@ private:
     static vp::IoReqStatus narrow_req(vp::Block *__this, vp::IoReq *req);
     static vp::IoReqStatus wide_req(vp::Block *__this, vp::IoReq *req);
     vp::IoReqStatus handle_req(vp::IoReq *req, bool wide);
+    // Destination side: build the object forwarded to the local target for one
+    // mesh request flit. Write data flits are wrapped in a distinct data-less
+    // pool beat (the write-ack contract makes the target consume and FREE
+    // granted write beats; the flit is a plain heap object); reads and atomics
+    // forward the flit itself.
+    vp::IoReq *make_target_req(FloonocReqV2 *req);
+    // Destination side: send (or re-send, from a retry) a request built by
+    // make_target_req to the local target and handle the inline outcomes.
+    // Returns true when the target denied it (the caller keeps it in its
+    // stalled slot and stalls the link it came in on).
+    bool send_to_target(vp::IoReq *to_send, bool wide);
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
     int get_req_nw(bool is_wide, bool is_write);
     int get_rsp_nw(bool is_wide, bool is_write);
@@ -126,6 +138,32 @@ private:
     // masters (payload co-allocated), indexed by the burst's wide flag:
     // [0] = narrow_width, [1] = wide_width.
     vp::IoReqAllocator *rsp_allocator[2];
+
+    // Size-0 (data-less) pools for the per-burst write-ack contract:
+    // - ack_allocator serves the single write burst ack sent upstream to the
+    //   external master once every beat of a burst has its B flit back.
+    // - fwd_wr_allocator serves the self-contained single-beat write beats
+    //   forwarded to the local target on the destination side (the target
+    //   frees granted write beats, so they must be pool objects — the
+    //   FloonocReqV2 flit is heap-managed and cannot be handed out).
+    vp::IoReqAllocator *ack_allocator;
+    vp::IoReqAllocator *fwd_wr_allocator;
+
+    // Initiator side, per-burst write tracking (io_v2 write-acknowledgement):
+    // incoming write beats are consumed (freed once their B flit returns) and
+    // the burst is acknowledged upstream exactly once, keyed by burst_id per
+    // input port ([0] = narrow, [1] = wide). A lone is_first && is_last beat
+    // with burst_id == -1 bypasses the map (it completes on its own B).
+    struct WrTrack
+    {
+        uint64_t issued_bytes = 0;
+        uint64_t acked_bytes = 0;
+        bool seen_last = false;
+        bool error = false;
+        void *initiator = nullptr;
+        uint64_t base = 0;
+    };
+    std::map<int64_t, WrTrack> wr_bursts[2];
 
     // Mesh links, indexed by NW_*: outputs inject into the routers, inputs
     // receive what the routers deliver.
@@ -159,9 +197,13 @@ private:
 
     // When a downstream target returns DENIED, v2 requires the master (this
     // NI) to hold the req and re-send it on the target's retry(). One slot
-    // per output port.
-    FloonocReqV2 *wide_target_stalled_req;
-    FloonocReqV2 *narrow_target_stalled_req;
+    // per output port. Holds whatever make_target_req built: the flit itself
+    // for reads/atomics, or our pool write beat for write data flits (the
+    // flit then stays reachable via beat->initiator).
+    // nullptr-initialized here (not just in reset()) because reset() itself
+    // inspects them to recycle a held pool write beat.
+    vp::IoReq *wide_target_stalled_req = nullptr;
+    vp::IoReq *narrow_target_stalled_req = nullptr;
     // Link input (NW_* index) to unstall when a target retry frees the
     // corresponding output, -1 when none. This is the link the denied request
     // ARRIVED on, which is not implied by its wide flag (a wide read AR

@@ -53,11 +53,6 @@ IDmaBeAxi::IDmaBeAxi(vp::Component *idma, std::string itf_name, IdmaBeProducer *
         this->trace.fatal("idma_v2: axi_width must be > 0\n");
     }
 
-    // One beat per axi_width bytes (writes), plus one extra in case the first
-    // beat is unaligned and shrinks below width. Reads only ever consume
-    // beats[0] (a single full-size req per burst).
-    int max_beats_per_burst = (AXI_PAGE_SIZE + this->axi_width - 1) / this->axi_width + 1;
-
     this->burst_info.resize(this->burst_queue_size);
     this->burst_data.resize(this->burst_queue_size);
 
@@ -65,19 +60,14 @@ IDmaBeAxi::IDmaBeAxi(vp::Component *idma, std::string itf_name, IdmaBeProducer *
     {
         BurstInfo *info = new BurstInfo();
         info->burst_id = i;
-        info->beats.resize(max_beats_per_burst);
-        // All beats from a given slot share the same initiator handle so the
-        // resp_meth callback can recover the slot in O(1).
-        for (vp::IoReq &beat : info->beats)
-        {
-            beat.initiator = info;
-        }
         this->burst_info[i] = info;
         this->burst_data[i] = new uint8_t[AXI_PAGE_SIZE];
     }
 
     // Data-less request pool (payload size 0), serving the whole-burst read
-    // requests (beat protocol: read burst requests carry no data).
+    // requests (read burst requests carry no data) and the per-issue write
+    // beats (data aliases the slot's staging buffer; the downstream consumer
+    // frees granted write beats, so they must be pool objects).
     this->req_allocator = vp::IoReqAllocator::get(0);
 }
 
@@ -94,6 +84,10 @@ IDmaBeAxi::~IDmaBeAxi()
             info->read_req->free();
         }
         delete info;
+    }
+    if (this->held_write_beat != nullptr)
+    {
+        this->held_write_beat->free();
     }
     for (uint8_t *buf : this->burst_data)
     {
@@ -123,8 +117,6 @@ void IDmaBeAxi::reset(bool active)
             info->bytes_responded = 0;
             info->bytes_acked = 0;
             info->write_pending_acks.clear();
-            info->write_bytes_source_acked = 0;
-            info->next_beat_idx = 0;
             if (info->read_req != nullptr)
             {
                 info->read_req->free();
@@ -134,6 +126,11 @@ void IDmaBeAxi::reset(bool active)
             this->free_bursts.push(info);
         }
 
+        if (this->held_write_beat != nullptr)
+        {
+            this->held_write_beat->free();
+            this->held_write_beat = nullptr;
+        }
         this->denied_blocked = false;
     }
 }
@@ -183,8 +180,6 @@ void IDmaBeAxi::enqueue_burst(uint64_t base, uint64_t size, bool is_write, IdmaT
     info->bytes_responded = 0;
     info->bytes_acked = 0;
     info->write_pending_acks.clear();
-    info->write_bytes_source_acked = 0;
-    info->next_beat_idx = 0;
     info->is_write = is_write;
 
     this->pending_bursts.push(info);
@@ -239,8 +234,12 @@ bool IDmaBeAxi::issue_beat()
         bool is_last  = (info->bytes_issued + beat_size == info->total_size);
 
         int slot_idx = (int)info->burst_id;
-        vp::IoReq *beat = &info->beats[info->next_beat_idx];
-        info->next_beat_idx++;
+        // Per-issue pool beat; a beat held from a DENIED is re-used verbatim.
+        // The buffer behind data (the slot's staging buffer) stays valid
+        // until the burst ack — the slot is only recycled then.
+        vp::IoReq *beat = this->held_write_beat != nullptr
+            ? this->held_write_beat : this->req_allocator->alloc();
+        this->held_write_beat = nullptr;
 
         beat->prepare();
         beat->set_is_write(true);
@@ -250,6 +249,8 @@ bool IDmaBeAxi::issue_beat()
         beat->is_first = is_first;
         beat->is_last  = is_last;
         beat->burst_id = info->burst_id;
+        // Same initiator on every beat of the burst; the burst ack echoes it.
+        beat->initiator = info;
         beat->set_resp_status(vp::IO_RESP_OK);
 
         this->trace.msg(vp::Trace::LEVEL_TRACE,
@@ -258,18 +259,39 @@ bool IDmaBeAxi::issue_beat()
             is_first ? 1 : 0, is_last ? 1 : 0);
 
         vp::IoReqStatus status = this->bus.req(beat);
-        // An IoV2Beat master never surfaces IO_REQ_DONE: an auto-inserted
-        // IoV2BeatAdapter converts inline DONE into scheduled beat callbacks,
-        // and a directly-bound IoV2Beat slave responds asynchronously per beat.
         if (status == vp::IO_REQ_DENIED)
         {
-            // Roll back the slot's beat-pool cursor; we'll re-issue the same
-            // beat on retry. The downstream has not taken the request.
-            info->next_beat_idx--;
+            // Hold the beat (still ours) and re-issue it on retry. Keep the
+            // event-deferred retry re-issue (retry_meth -> update()): the
+            // calibrated timings were pinned with it.
+            this->held_write_beat = beat;
             this->denied_blocked = true;
             this->trace.msg(vp::Trace::LEVEL_TRACE,
                 "Write beat denied by AXI (slot: %d)\n", slot_idx);
             return false;
+        }
+        if (status == vp::IO_REQ_DONE)
+        {
+            // Inline burst ack (only legal on the last beat, or as the
+            // DONE+INVALID escape hatch). We keep the beat — recycle it.
+            this->traces.assert(is_last
+                    || beat->get_resp_status() == vp::IO_RESP_INVALID,
+                "inline DONE on a non-last write beat without IO_RESP_INVALID");
+            // No adapter in the tree annotates an inline write ack with a
+            // deferred latency on this path today; completing immediately
+            // keeps the accounting simple. Revisit if a native beat slave
+            // starts returning annotated inline acks to the iDMA.
+            this->traces.assert(beat->get_full_latency() == 0,
+                "inline write burst ack carries a latency annotation");
+            vp::IoRespStatus resp_status = beat->get_resp_status();
+            beat->free();
+            if (is_last)
+            {
+                info->bytes_issued += beat_size;
+                this->pending_bursts.pop();
+                this->complete_write_burst(info, resp_status);
+                return true;
+            }
         }
 
         info->bytes_issued += beat_size;
@@ -344,36 +366,22 @@ vp::IoRespAck IDmaBeAxi::resp_meth(vp::Block *__this, vp::IoReq *req)
             info->burst_id, req->get_addr(), beat_size);
     }
 
-    info->bytes_responded += beat_size;
-
     if (info->is_write)
     {
-        // Walk the source-chunk FIFO and ack every chunk whose end byte is
-        // now <= bytes_responded. ack_data() on the central BE frees the
-        // source's buffer AND advances the transfer's ack_size — both
-        // depend on the corresponding write having really happened, so this
-        // must run after the responding beat, not when the chunk was first
-        // accepted by write_data().
-        while (!info->write_pending_acks.empty())
-        {
-            auto &front = info->write_pending_acks.front();
-            uint64_t chunk_end = info->write_bytes_source_acked + front.second;
-            if (chunk_end > info->bytes_responded) break;
-
-            self->be->ack_data(info->transfer, front.first, front.second);
-            info->write_bytes_source_acked = chunk_end;
-            info->write_pending_acks.pop_front();
-        }
-
-        if (info->bytes_responded == info->total_size)
-        {
-            self->trace.msg(vp::Trace::LEVEL_TRACE,
-                "Write burst done (slot: %ld)\n", info->burst_id);
-            self->free_bursts.push(info);
-            self->be->update();
-        }
+        // The single data-less burst ack (per-burst write acknowledgement).
+        // It arrives on exactly the cycle the old last per-beat ack fired,
+        // so completing everything here — including all deferred source
+        // acks — is timing-identical to the previous per-beat accounting.
+        self->traces.assert(req->is_last && req->get_data() == nullptr,
+            "malformed write burst ack (last=%d, data=%p)",
+            req->is_last ? 1 : 0, req->get_data());
+        vp::IoRespStatus status = req->get_resp_status();
+        req->free();
+        self->complete_write_burst(info, status);
         return vp::IO_RESP_ACCEPTED;
     }
+
+    info->bytes_responded += beat_size;
 
     // Read beat: a distinct allocator-backed object whose co-allocated payload
     // carries the data (our read_req is data-less and never round-tripped).
@@ -413,6 +421,29 @@ vp::IoRespAck IDmaBeAxi::resp_meth(vp::Block *__this, vp::IoReq *req)
     }
 
     return vp::IO_RESP_ACCEPTED;
+}
+
+
+
+void IDmaBeAxi::complete_write_burst(BurstInfo *info, vp::IoRespStatus status)
+{
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "Write burst done (slot: %ld)\n", info->burst_id);
+
+    // Drain the whole source-chunk FIFO in order. ack_data() on the central
+    // BE frees the source's buffer AND advances the transfer's ack_size —
+    // both depend on the write having really happened, which the burst ack
+    // guarantees for every beat at once.
+    while (!info->write_pending_acks.empty())
+    {
+        auto &front = info->write_pending_acks.front();
+        this->be->ack_data(info->transfer, front.first, front.second);
+        info->write_pending_acks.pop_front();
+    }
+
+    (void)status;
+    this->free_bursts.push(info);
+    this->be->update();
 }
 
 

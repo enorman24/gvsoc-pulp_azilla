@@ -41,11 +41,17 @@
  *             resp() per axi_width-sized beat, paced at one beat per cycle.
  *   - Writes: N IoReqs per burst, size = axi_width per beat (with the tail
  *             possibly smaller), is_first / is_last / burst_id set on each.
- *             Each write beat receives a single resp() back.
+ *             Per the io_v2 write-acknowledgement contract (AXI B-channel
+ *             semantics) the beats are size-0-pool objects the downstream
+ *             consumer frees; the burst is acknowledged exactly once — the
+ *             last beat's inline DONE or one distinct data-less ack — and
+ *             all source-chunk acks (be->ack_data) are issued at that
+ *             single completion, whose cycle equals the old last per-beat
+ *             ack cycle.
  *
- * Per-burst state lives in BurstInfo slots; the slot stays alive until every
- * beat has been responded to (writes) or until the destination BE has
- * acknowledged every chunk pushed downstream (reads).
+ * Per-burst state lives in BurstInfo slots; the slot stays alive until the
+ * burst ack arrives (writes) or until the destination BE has acknowledged
+ * every chunk pushed downstream (reads).
  */
 class IDmaBeAxi : public vp::Block, public IdmaBeConsumer
 {
@@ -66,10 +72,11 @@ public:
     bool is_empty() override;
 
 private:
-    // Per-burst state. One BurstInfo + one data buffer + one beat pool per slot,
-    // all pre-allocated at construction time. Slots are dispatched via free_bursts
+    // Per-burst state. One BurstInfo + one data buffer per slot, all
+    // pre-allocated at construction time. Slots are dispatched via free_bursts
     // and recycled when their completion condition is met:
-    //   - writes: bytes_responded reaches total_size (all per-beat acks received)
+    //   - writes: the single burst ack arrives (or the last beat completes
+    //             inline)
     //   - reads:  bytes_acked reaches total_size (destination BE acked every
     //             forwarded chunk)
     struct BurstInfo
@@ -79,7 +86,8 @@ private:
         uint64_t base = 0;
         uint64_t total_size = 0;
         // Cursors. bytes_buffered is only used by writes (filled by write_data
-        // before the bus has a chance to consume it).
+        // before the bus has a chance to consume it). bytes_responded is only
+        // used by reads (writes complete on the single burst ack).
         uint64_t bytes_buffered = 0;
         uint64_t bytes_issued = 0;
         uint64_t bytes_responded = 0;
@@ -88,23 +96,14 @@ private:
         uint64_t bytes_acked = 0;
         // Source-side chunks received via write_data() but not yet
         // acknowledged. The destination BE owes the source one
-        // ack_data(transfer, data, size) per entry; we issue those only
-        // after the corresponding write beats have been responded so the
-        // source doesn't see the write complete before it actually has.
+        // ack_data(transfer, data, size) per entry; all of them are issued
+        // in order when the burst ack arrives (the ack implies every beat
+        // was consumed), so the source never sees the write complete before
+        // it actually has.
         std::deque<std::pair<uint8_t *, uint64_t>> write_pending_acks;
-        // Sum of sizes in write_pending_acks already covered by responses
-        // (used so we can walk write_pending_acks and ack one entry once
-        // bytes_responded crosses its end boundary).
-        uint64_t write_bytes_source_acked = 0;
         // Unique tag carried by every beat of this burst on the io_v2 master.
         // We use the slot index so it is unique and stable.
         int64_t burst_id = -1;
-        // Where the next free beat IoReq sits inside `beats`. Increments
-        // monotonically as issue_beat() consumes them; reset when the slot is
-        // freed.
-        int next_beat_idx = 0;
-        // Pre-allocated beat pool used by writes (one slot per cycle).
-        std::vector<vp::IoReq> beats;
         // Read request: a single full-size, data-less IoReq per burst, drawn
         // from the shared IoReqAllocator (payload size 0). We own it
         // (initiator-owned convention) for the whole transaction and free it
@@ -143,8 +142,11 @@ private:
     int burst_queue_size;    // number of in-flight bursts (slot count)
 
     // Shared data-less request pool (payload size 0) serving the whole-burst
-    // read requests.
+    // read requests and the per-issue write beats (data aliases the slot's
+    // staging buffer; the downstream consumer frees granted write beats).
     vp::IoReqAllocator *req_allocator = nullptr;
+    // Write beat held across a DENIED (we still own it; re-issued on retry).
+    vp::IoReq *held_write_beat = nullptr;
 
     // Slot pool: one BurstInfo per slot. Indexed by slot id, which is also the
     // burst_id we tag every beat with.
@@ -173,4 +175,8 @@ private:
     // v2 deny/retry: when the AXI master gets IO_REQ_DENIED on a send, it
     // suspends issuing until retry_meth() fires.
     bool denied_blocked = false;
+
+    // Complete a write burst: drain the whole source-chunk ack FIFO in
+    // order, recycle the slot, and nudge the central BE.
+    void complete_write_burst(BurstInfo *info, vp::IoRespStatus status);
 };
