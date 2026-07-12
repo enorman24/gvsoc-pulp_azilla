@@ -57,12 +57,13 @@ public:
     // (write-ack contract) — on the B return path the pointer is then STALE
     // and must not be dereferenced (the ack accounting rides in the flit's
     // own fields: burst_id, initiator, initiator_addr, size). A beat SPLIT
-    // across several W flits (oversized beats do reach the NI: transparent
-    // IoV2Any forwarders like the limiter bypass bind-time width matching,
-    // and the entry clamp can split when max_burst_size is 0) keeps the
-    // legacy scheme instead: the beat stays alive — nobody frees it before
-    // its B — its buffer backs all the W flits, and the source NI frees it
-    // when its single B flit returns.
+    // across several W flits (oversized beats do reach the NI: a big-packet
+    // form write is a legal one-beat burst of any size — e.g. from a
+    // collapse adapter, or a beat master with runtime-sized chunks like the
+    // traffic generator — and the entry clamp can split when max_burst_size
+    // is 0) keeps the legacy scheme instead: the beat stays alive — nobody
+    // frees it before its B — its buffer backs all the W flits, and the
+    // source NI frees it when its single B flit returns.
     vp::IoReq *burst;
     // True on a W flit that covers its whole beat: the flit carries beat
     // ownership (see `burst` above). Decided at enqueue time on the source

@@ -92,9 +92,9 @@ class Testbench(gvsoc.systree.Component):
 
         for x in range(0, nb_cluster_x):
             for y in range(0, nb_cluster_y):
-                generator_w = GeneratorV2(self, f'generator_{x}_{y}_w', max_burst_size=4096)
+                generator_w = GeneratorV2(self, f'generator_{x}_{y}_w', max_burst_size=4096, width=64)
                 generator_w.o_OUTPUT(noc.i_CLUSTER_WIDE_INPUT(x, y))
-                generator_n = GeneratorV2(self, f'generator_{x}_{y}_n', max_burst_size=4096)
+                generator_n = GeneratorV2(self, f'generator_{x}_{y}_n', max_burst_size=4096, width=8)
                 generator_n.o_OUTPUT(noc.i_CLUSTER_NARROW_INPUT(x, y))
 
                 if use_memory:

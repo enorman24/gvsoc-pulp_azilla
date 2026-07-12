@@ -170,10 +170,11 @@ void NetworkQueueV2::enqueue_router_req(vp::IoReq *req, bool is_address, bool wi
         // Beat encapsulation: a W flit that covers its WHOLE beat carries
         // beat ownership — the destination hands the beat itself to the
         // target (no wrapper) and the beat is consumed and freed there. A
-        // split beat (a slice smaller than the beat: oversized input beats
-        // behind transparent IoV2Any forwarders, or the entry clamp above)
-        // keeps the legacy scheme — its buffer must outlive every flit, so
-        // the beat stays unfreed until its B flit returns to the source.
+        // split beat (a slice smaller than the beat: oversized big-packet
+        // form one-beat writes, which are legal at any size, or the entry
+        // clamp above) keeps the legacy scheme — its buffer must outlive
+        // every flit, so the beat stays unfreed until its B flit returns to
+        // the source.
         router_req->owns_beat = !is_address && req->get_opcode() == vp::WRITE
             && size == req->get_size();
 
@@ -755,8 +756,8 @@ vp::IoReqStatus NetworkInterfaceV2::handle_req(vp::IoReq *req, bool wide)
 // IoV2Beat-signature'd binding an incoming beat is capped at the port width,
 // which is also the carrier queue's slice width.
 //
-// A flit of a SPLIT beat (oversized beats behind transparent IoV2Any
-// forwarders, or an entry-clamped slice) is wrapped in a DISTINCT data-less
+// A flit of a SPLIT beat (an oversized big-packet-form one-beat write, or
+// an entry-clamped slice) is wrapped in a DISTINCT data-less
 // pool beat instead: the external beat's buffer must stay valid for the
 // beat's other flits, so the beat itself must not be handed out (the target
 // would free it); it stays unfreed until its B flit returns to the source.

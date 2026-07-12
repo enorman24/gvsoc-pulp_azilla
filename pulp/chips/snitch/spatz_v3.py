@@ -29,7 +29,7 @@ is loaded through ``utils.loader.loader_v2``.
 import os
 
 import gvsoc.systree
-from gvsoc.signature import IoV2Any
+from gvsoc.signature import IoV2Beat
 from vp.clock_domain import Clock_domain
 import memory.memory_v3 as memory_v3
 from memory.memory_v3 import MemoryV3Config
@@ -205,10 +205,10 @@ class Soc(gvsoc.systree.Component):
         self.set_parameter('binary', binary)
 
     def i_HBM(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Any())
+        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Beat(64))
 
     def o_HBM(self, itf: gvsoc.systree.SlaveItf):
-        self.itf_bind('hbm', itf, signature=IoV2Any())
+        self.itf_bind('hbm', itf, signature=IoV2Beat(64))
 
 
 class Spatz(gvsoc.systree.Component):
@@ -221,7 +221,10 @@ class Spatz(gvsoc.systree.Component):
         soc.o_HBM(self.i_HBM())
 
     def i_HBM(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Any())
+        return gvsoc.systree.SlaveItf(self, 'hbm', signature=IoV2Beat(64))
+
+    def o_HBM(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('hbm', itf, signature=IoV2Beat(64))
 
 
 class SpatzBoard(gvsoc.systree.Component):
@@ -251,4 +254,8 @@ class SpatzBoard(gvsoc.systree.Component):
 
         self.bind(clock, 'out', chip, 'clock')
         self.bind(clock, 'out', mem, 'clock')
-        self.bind(chip, 'hbm', mem, 'input')
+        # Signatured binding so the auto-bridge pass sees IoV2Beat(64) master
+        # vs IoV2Sync memory and inserts the beat-to-sync converter (a raw
+        # bind() carries no signatures and would leave the beat router facing
+        # the sync memory's inline DONE, which a beat master must never see).
+        chip.o_HBM(mem.i_INPUT())
