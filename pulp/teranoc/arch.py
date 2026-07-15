@@ -47,6 +47,13 @@ class TeranocConfig:
     # ports within a batch are shuffled.
     l1_noc_remap_batch_size:  int
     l1_noc_remap_shuffle:     bool
+    # L2 AXI bank interleave granularity in bytes, consumed by the L2 DPI
+    # checker in teranoc_system.py. Upstream commit 664ea862 referenced
+    # arch.l2_axi_interleave but never added the field here, so config
+    # generation crashed. Default 16 mirrors the hardcoded
+    # L2AddressScrambler(interleave=16) for the same L2. [LOCAL PATCH — see
+    # ARAXL_TERANOC_MODEL_PATHS.md; report/upstream to gvsoc-pulp]
+    l2_axi_interleave:        int = 16
 
     # ----- Derived -----
     @property
